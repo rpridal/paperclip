@@ -284,13 +284,23 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
   });
   const sessionHandoff = nonEmpty(ctx.context.paperclipSessionHandoffMarkdown);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(ctx.context);
+  // Prompt layout is a prompt-cache contract, not a style choice. The provider
+  // (DeepSeek) caches on the byte prefix of the request, and with
+  // `sessionKeyStrategy: "run"` every wake is a fresh run, so the prefix this
+  // layout produces is the only thing a later wake can reuse. Keep every
+  // run-varying value (run id, wake delta, session handoff, structured payload)
+  // strictly *after* the parts that repeat: the identity block, the execution
+  // contract and the task brief. Measured on the pre-change layout: two wakes of
+  // the same issue shared 159 chars (~40 tokens) because the run id sat in the
+  // identity block; the card after it was re-read at full miss price every time.
   const lines = [
     `You are ${ctx.agent.name}, an AI agent employee in a Paperclip-managed company.`,
     "",
+    // Stable prefix. Agent id, company id, API URL and work mode are the same
+    // for every run dispatched to this agent; do not add per-run values here.
     "Paperclip runtime identity:",
     `- Agent ID: ${ctx.agent.id}`,
     `- Company ID: ${ctx.agent.companyId}`,
-    `- Run ID: ${ctx.runId}`,
     ...(paperclipApiUrl ? [`- Paperclip API URL: ${paperclipApiUrl}`] : []),
     ...(issueWorkMode ? [`- Issue work mode: ${issueWorkMode}`] : []),
     "",
@@ -304,9 +314,13 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
           "- Use X-Paperclip-Run-Id on mutating Paperclip API requests when a Paperclip API key is available.",
           "",
         ]),
+    // The task brief is the largest stable block: the same issue sends the same
+    // card on its next wake, so it goes before the wake delta to stay cacheable.
+    ...(taskMarkdown ? [taskMarkdown, ""] : []),
     wakePrompt,
     ...(sessionHandoff ? ["", sessionHandoff] : []),
-    ...(taskMarkdown ? ["", taskMarkdown] : []),
+    // Dynamic tail. The structured payload still leads with the issue identity,
+    // so consecutive wakes of one issue keep a cacheable prefix here too.
     ...(wakePayloadJson
       ? [
           "",
@@ -316,6 +330,9 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
           "```",
         ]
       : []),
+    "",
+    "Paperclip run identity:",
+    `- Run ID: ${ctx.runId}`,
   ];
   return lines.filter((line) => line !== null && line !== undefined).join("\n").trim();
 }
