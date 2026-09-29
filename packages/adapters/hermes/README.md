@@ -168,6 +168,19 @@ secret values, so do not copy printed tokens into comments or config. Use
 multiline comments or status updates, preserve newlines with a heredoc plus
 `jq --arg`.
 
+### Prompt layout is a prompt-cache contract
+
+`buildInput()` in `src/gateway/server/execute.ts` decides the byte prefix of every
+dispatched run. With `sessionKeyStrategy: "run"` each wake starts a fresh remote
+run, so the prefix two wakes share is the only reuse the provider prompt cache can
+make. Keep run-varying values (run id, wake delta, session handoff, structured
+wake payload) *after* the blocks that repeat (runtime identity, execution
+contract, task card). Measured with a card-sized fixture and one issue woken
+twice: with the run id in the identity block the two prompts shared 159 characters
+(~40 tokens); with the card first and the run identity last they share the whole
+card (~147 800 of 149 200 characters). `execute.test.ts`
+("keeps a byte-stable prompt prefix across wakes of the same issue") pins this.
+
 ### Hermes-originated Paperclip tasks
 
 The package includes a Hermes skill/helper for the reverse direction: a user

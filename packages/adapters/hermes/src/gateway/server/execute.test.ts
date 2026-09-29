@@ -276,6 +276,89 @@ describe("execute", () => {
     expect(runBodies[1]!.input).not.toContain(description);
   });
 
+  it("keeps a byte-stable prompt prefix across wakes of the same issue", async () => {
+    // Prompt-cache contract: the served agents run with `sessionKeyStrategy:
+    // "run"`, so every wake is a fresh run and the only reuse the provider can
+    // make is the byte prefix two wakes of one issue share. Run ids, the wake
+    // delta and the structured payload therefore belong *after* the card, not in
+    // front of it.
+    const description = "Keep the prompt prefix byte-stable for the provider cache.";
+    // A real card is the largest block of the prompt (measured 18-29k tokens on
+    // this lane), so the fixture carries a card-sized body instead of one line.
+    const cardBody = Array.from(
+      { length: 300 },
+      (_, index) => `- card detail ${index}: the same issue sends this line on its next wake.`,
+    ).join("\n");
+    const taskMarkdown = [
+      "Paperclip task context:",
+      '- Issue: "PAP-1"',
+      "",
+      "Issue description:",
+      "```text",
+      description,
+      cardBody,
+      "```",
+    ].join("\n");
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => new Response(JSON.stringify(
+      String(input).endsWith("/v1/runs")
+        ? { run_id: "run-hermes-1", status: "started" }
+        : { status: "completed", output: "done" },
+    ), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const wakeCtx = (runId: string, reason: string) => {
+      const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 5 });
+      ctx.runId = runId;
+      ctx.context = {
+        issueId: "issue-1",
+        wakeReason: reason,
+        paperclipTaskMarkdown: taskMarkdown,
+        paperclipTaskMarkdownCompact: taskMarkdown,
+        paperclipWake: {
+          reason,
+          issue: {
+            id: "issue-1",
+            identifier: "PAP-1",
+            title: "Do the thing",
+            description,
+            descriptionTruncated: false,
+            status: "in_progress",
+          },
+          commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+          comments: [],
+          fallbackFetchNeeded: false,
+        },
+      };
+      return ctx;
+    };
+
+    await execute(wakeCtx("pc-run-first", "issue_assigned"));
+    await execute(wakeCtx("pc-run-second", "issue_commented"));
+
+    const prompts = (fetchMock.mock.calls as Array<[RequestInfo | URL, RequestInit?]>)
+      .filter(([input]) => String(input).endsWith("/v1/runs"))
+      .map(([, init]) => JSON.parse(String(init?.body)) as { input: string });
+    expect(prompts).toHaveLength(2);
+    const first = prompts[0]!.input;
+    const second = prompts[1]!.input;
+
+    let shared = 0;
+    while (shared < Math.min(first.length, second.length) && first[shared] === second[shared]) shared += 1;
+    const shortest = Math.min(first.length, second.length);
+
+    // Same issue on both wakes: everything except the run-varying tail matches.
+    expect(shared / shortest).toBeGreaterThan(0.5);
+    // The card is what the next wake reuses, so the whole card must be inside it.
+    expect(first.slice(0, shared)).toContain(taskMarkdown);
+    // Run identity varies run to run: it must not sit in front of the card.
+    expect(first.slice(0, shared)).not.toContain("pc-run-first");
+    expect(first.indexOf("Paperclip run identity:")).toBeGreaterThan(first.indexOf(description));
+    expect(second.indexOf("- Run ID: pc-run-second")).toBeGreaterThan(second.indexOf(description));
+    // Each run still carries its own run id.
+    expect(first).toContain("- Run ID: pc-run-first");
+    expect(second).toContain("- Run ID: pc-run-second");
+  });
+
   it("routes a bare Hermes dashboard URL on port 9119 through the API prefix", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
