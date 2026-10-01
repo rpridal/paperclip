@@ -13,7 +13,9 @@ export const upsertBudgetPolicySchema = z.object({
   windowKind: z.enum(BUDGET_WINDOW_KINDS).optional().default("calendar_month_utc"),
   amount: z.number().int().nonnegative(),
   warnPercent: z.number().int().min(1).max(99).optional().default(80),
-  hardStopEnabled: z.boolean().optional().default(true),
+  // A new policy must not arm a hard stop as a side effect of being created:
+  // the hard stop stays a deliberate, per-row decision.
+  hardStopEnabled: z.boolean().optional().default(false),
   notifyEnabled: z.boolean().optional().default(true),
   isActive: z.boolean().optional().default(true),
 });

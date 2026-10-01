@@ -940,7 +940,7 @@ export function AgentDetail() {
       utilizationPercent:
         budgetMonthlyCents > 0 ? Number(((spentMonthlyCents / budgetMonthlyCents) * 100).toFixed(2)) : 0,
       warnPercent: 80,
-      hardStopEnabled: true,
+      hardStopEnabled: false,
       notifyEnabled: true,
       isActive: budgetMonthlyCents > 0,
       status: budgetMonthlyCents > 0 && spentMonthlyCents >= budgetMonthlyCents ? "hard_stop" : "ok",

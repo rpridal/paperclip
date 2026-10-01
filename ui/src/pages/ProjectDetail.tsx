@@ -609,7 +609,7 @@ export function ProjectDetail() {
       remainingAmount: 0,
       utilizationPercent: 0,
       warnPercent: 80,
-      hardStopEnabled: true,
+      hardStopEnabled: false,
       notifyEnabled: true,
       isActive: false,
       status: "ok",

@@ -12,7 +12,7 @@ export const budgetPolicies = pgTable(
     windowKind: text("window_kind").notNull(),
     amount: integer("amount").notNull().default(0),
     warnPercent: integer("warn_percent").notNull().default(80),
-    hardStopEnabled: boolean("hard_stop_enabled").notNull().default(true),
+    hardStopEnabled: boolean("hard_stop_enabled").notNull().default(false),
     notifyEnabled: boolean("notify_enabled").notNull().default(true),
     isActive: boolean("is_active").notNull().default(true),
     createdByUserId: text("created_by_user_id"),
