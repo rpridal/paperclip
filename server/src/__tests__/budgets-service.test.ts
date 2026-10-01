@@ -412,6 +412,47 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     return event!;
   }
 
+  it("creates new agent and project budget policies with the hard stop off, including the column default", async () => {
+    const { companyId, agentId, projectId } = await createBudgetFixture();
+    const service = budgetService(db, { cancelWorkForScope: vi.fn().mockResolvedValue(undefined) });
+
+    const agentSummary = await service.upsertPolicy(
+      companyId,
+      { scopeType: "agent", scopeId: agentId, amount: 100, windowKind: "calendar_month_utc" },
+      null,
+    );
+    const projectSummary = await service.upsertPolicy(
+      companyId,
+      { scopeType: "project", scopeId: projectId, amount: 500 },
+      null,
+    );
+
+    expect(agentSummary.hardStopEnabled).toBe(false);
+    expect(projectSummary.hardStopEnabled).toBe(false);
+    expect(agentSummary.status).not.toBe("hard_stop");
+
+    const rows = await db.select().from(budgetPolicies).orderBy(budgetPolicies.scopeType);
+    expect(rows.map((row) => ({ scopeType: row.scopeType, hardStopEnabled: row.hardStopEnabled }))).toEqual([
+      { scopeType: "agent", hardStopEnabled: false },
+      { scopeType: "project", hardStopEnabled: false },
+    ]);
+
+    // The column default itself (migration 0285) is off, so even a row that
+    // never names the column cannot arm a hard stop.
+    const [columnDefaultRow] = await db
+      .insert(budgetPolicies)
+      .values({
+        companyId,
+        scopeType: "company",
+        scopeId: companyId,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount: 0,
+      })
+      .returning();
+    expect(columnDefaultRow!.hardStopEnabled).toBe(false);
+  });
+
   it("raises one soft incident per window before hard-stopping and safely logging agent telemetry", async () => {
     const { companyId, agentId } = await createBudgetFixture();
     const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);

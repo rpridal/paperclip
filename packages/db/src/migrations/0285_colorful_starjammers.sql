@@ -1,0 +1,1 @@
+ALTER TABLE "budget_policies" ALTER COLUMN "hard_stop_enabled" SET DEFAULT false;

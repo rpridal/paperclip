@@ -559,7 +559,8 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             windowKind,
             amount,
             warnPercent: input.warnPercent ?? 80,
-            hardStopEnabled: input.hardStopEnabled ?? true,
+            // A new row must not arm a hard stop unless the caller asks for it.
+            hardStopEnabled: input.hardStopEnabled ?? false,
             notifyEnabled: input.notifyEnabled ?? true,
             isActive: nextIsActive,
             createdByUserId: actorUserId,
