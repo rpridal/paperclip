@@ -677,6 +677,8 @@ export interface IssueExecutionPolicy {
    * default. Human decisions reset the round counter.
    */
   maxReviewRounds?: number | null;
+  /** Opt in to invalidating review and later gates when a participant requests changes. */
+  restartReviewOnChangesRequested?: boolean;
 }
 
 export interface IssueExecutionMonitorState {
