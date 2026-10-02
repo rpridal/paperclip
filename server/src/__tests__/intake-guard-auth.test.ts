@@ -15,7 +15,7 @@ function fixture() {
     issuedAt: new Date(Date.now()-1000).toISOString(), expiresAt: new Date(Date.now()+86400000).toISOString(),
     issuerUserId: 'offline-operator', credentialVersion: 'offline-v1',
   });
-  const store = { list: async () => [], audit: async () => {}, read: async () => null, create: async () => ({ id: 'd1b6c3a4-6038-4bb7-bc26-3934d59071ff' }) };
+  const store = { authorize: async () => true, list: async () => [], audit: async () => {}, read: async () => null, create: async () => ({ id: 'd1b6c3a4-6038-4bb7-bc26-3934d59071ff' }) };
   const db = { select: () => ({ from: () => ({ where: async () => [] }) }) } as any;
   const app = express(); app.use(express.json());
   app.use(actorMiddleware(db, { deploymentMode: 'authenticated', intakeGuardStore: store } as any));
@@ -66,6 +66,35 @@ describe('intake guard service identity — OFFLINE HTTP/auth tests, stub store'
       observedAt: new Date().toISOString(), queued: 21, lastCompletedAt: null, producerSuspended: true, [field]: 'foreign',
     });
     expect(res.status).toBe(400);
+  });
+  it.each(['expired', 'future', 'overlong', 'revoked', 'rotated', 'wrong-company'])('fails closed for %s identity configuration', async mode => {
+    const { app, token } = fixture();
+    const config = JSON.parse(process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY!);
+    const now = Date.now();
+    if (mode === 'expired') { config.issuedAt = new Date(now - 60000).toISOString(); config.expiresAt = new Date(now - 1000).toISOString(); }
+    if (mode === 'future') config.issuedAt = new Date(now + 10000).toISOString();
+    if (mode === 'overlong') config.expiresAt = new Date(now + 31 * 24 * 60 * 60 * 1000).toISOString();
+    if (mode === 'rotated') config.keyHash = createHash('sha256').update(randomBytes(32)).digest('hex');
+    if (mode === 'wrong-company') config.companyId = '00000000-0000-4000-8000-000000000000';
+    process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY = JSON.stringify(config);
+    if (mode === 'revoked') delete process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY;
+    const res = await request(app).get(`/api/companies/${companyId}/intake-guard/findings`).set('Authorization', `Bearer ${token}`);
+    expect(res.status).toBe(401); expect(res.body.escaped).toBeUndefined();
+    expect(JSON.stringify(res.body).includes(token)).toBe(false);
+  });
+  it('denies a foreign finding type', async () => {
+    const { app, token } = fixture();
+    const res = await request(app).post(`/api/companies/${companyId}/intake-guard/findings`).set('Authorization', `Bearer ${token}`).send({
+      type: 'foreign_finding', episodeId: 'ecb4be6b-96a6-49bb-90c2-bdfe280b690a', reasons: ['queue_growing_without_completion'],
+      observedAt: new Date().toISOString(), queued: 21, lastCompletedAt: null, producerSuspended: true,
+    });
+    expect(res.status).toBe(400);
+  });
+  it('denies a revoked issuer membership before any finding access', async () => {
+    const { app, token, store } = fixture();
+    Object.assign(store, { authorize: async () => false });
+    const res = await request(app).get(`/api/companies/${companyId}/intake-guard/findings`).set('Authorization', `Bearer ${token}`);
+    expect(res.status).toBe(401);
   });
   it('fails closed on audit failure without returning credential material', async () => {
     const { app, token, store } = fixture(); store.audit = async () => { throw new Error(token); };

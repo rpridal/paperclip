@@ -1,8 +1,8 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { Request, Response } from 'express';
 import type { Db } from '@paperclipai/db';
-import { activityLog, companies, issues } from '@paperclipai/db';
-import { and, eq, desc } from 'drizzle-orm';
+import { activityLog, companies, companyMemberships, issues } from '@paperclipai/db';
+import { and, eq, desc, inArray } from 'drizzle-orm';
 import { z } from 'zod';
 
 export const INTAKE_COMPANY_ID = 'b954377a-979e-461a-b568-44f9104f0512';
@@ -21,6 +21,7 @@ export const findingSchema = z.object({
 export type IntakeFinding = z.infer<typeof findingSchema>;
 type FindingRow = { id: string; identifier?: string | null; status?: string; description?: string | null };
 export interface IntakeGuardStore {
+  authorize(identity: IntakeGuardIdentity): Promise<boolean>;
   list(identity: IntakeGuardIdentity): Promise<unknown[]>;
   audit(identity: IntakeGuardIdentity, outcome: string): Promise<void>;
   read(identity: IntakeGuardIdentity, id: string): Promise<FindingRow | null>;
@@ -33,6 +34,14 @@ const projection = { id: issues.id, identifier: issues.identifier, title: issues
   assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId };
 export function intakeGuardStore(db: Db): IntakeGuardStore {
   return {
+    authorize: async identity => {
+      const [member] = await db.select({ id: companyMemberships.id }).from(companyMemberships)
+        .innerJoin(companies, eq(companyMemberships.companyId, companies.id)).where(and(
+          eq(companies.id, identity.companyId), eq(companies.status, 'active'),
+          eq(companyMemberships.principalType, 'user'), eq(companyMemberships.principalId, identity.issuerUserId),
+          eq(companyMemberships.status, 'active'), inArray(companyMemberships.membershipRole, ['owner', 'admin', 'operator', 'member'])));
+      return !!member;
+    },
     list: async identity => db.select(projection).from(issues).where(owned(identity)),
     read: async (identity, id) => db.transaction(async tx => {
       const [row] = await tx.select(projection).from(issues).where(and(owned(identity), eq(issues.id, id)));
@@ -94,6 +103,9 @@ export async function handleIntakeGuard(req: Request, res: Response, store: Inta
       || now < Date.parse(identity.issuedAt) || now >= Date.parse(identity.expiresAt)
       || Date.parse(identity.expiresAt) - Date.parse(identity.issuedAt) > 30 * 86400000) {
     await store.audit(identity, 'auth_denied'); res.status(401).json({ error: 'Invalid service credential' }); return true;
+  }
+  if (!(await store.authorize(identity))) {
+    await store.audit(identity, 'issuer_denied'); res.status(401).json({ error: 'Invalid service credential' }); return true;
   }
   const listPath = `/api/companies/${identity.companyId}/intake-guard/findings`;
   if (req.method === 'GET' && req.originalUrl === listPath) {
