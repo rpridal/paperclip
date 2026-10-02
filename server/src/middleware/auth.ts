@@ -26,6 +26,7 @@ import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { captureRunIdentity } from "../services/run-identity.js";
 import { boardAuthService } from "../services/board-auth.js";
+import { handleIntakeGuard, intakeGuardStore, type IntakeGuardStore } from "../services/intake-guard.js";
 
 const CLOUD_TENANT_WRITE_DEBOUNCE_MS = 5_000;
 const CLOUD_TENANT_WRITE_DEBOUNCE_MAX = 1_000;
@@ -211,6 +212,7 @@ async function auditAgentKeyMissingResponsibleUser(
 interface ActorMiddlewareOptions {
   deploymentMode: DeploymentMode;
   resolveSession?: (req: Request) => Promise<BetterAuthSessionResult | null>;
+  intakeGuardStore?: IntakeGuardStore;
 }
 
 const publicRoutineWebhookPath = /^\/api\/routine-triggers\/public\/[a-f0-9]{24}\/fire\/?$/i;
@@ -219,7 +221,15 @@ const publicMcpGatewayProtocolPath = /^\/mcp\/gateways\/gw_[a-f0-9]{32}\/?$/i;
 
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
   const boardAuth = boardAuthService(db);
+  const findingStore = opts.intakeGuardStore ?? intakeGuardStore(db);
   return async (req, _res, next) => {
+    try {
+      if (await handleIntakeGuard(req, _res, findingStore)) return;
+    } catch {
+      // Do not log bearer/config/body material; fail closed on store/audit failure.
+      _res.status(503).json({ error: "Service authorization unavailable" });
+      return;
+    }
     req.actor =
       opts.deploymentMode === "local_trusted"
         ? {
