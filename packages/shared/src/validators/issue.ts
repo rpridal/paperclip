@@ -432,6 +432,7 @@ export const issueExecutionMonitorPolicySchema = z.object({
 });
 
 export const issueExecutionPolicySchema = z.object({
+  restartReviewOnChangesRequested: z.boolean().optional(),
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
   commentRequired: z.boolean().optional().default(true),
   stages: z.array(issueExecutionStageSchema).default([]),
