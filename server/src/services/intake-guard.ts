@@ -56,10 +56,13 @@ export function intakeGuardStore(db: Db): IntakeGuardStore {
       const [company] = await tx.select().from(companies).where(eq(companies.id, identity.companyId)).for('update');
       if (!company || company.status !== 'active') throw new Error('company unavailable');
       const rows = await tx.select().from(issues).where(owned(identity)).orderBy(desc(issues.createdAt));
+      const project = (row: typeof issues.$inferSelect) => ({ id: row.id, identifier: row.identifier,
+        title: row.title, description: row.description, status: row.status, createdAt: row.createdAt,
+        assigneeAgentId: row.assigneeAgentId, assigneeUserId: row.assigneeUserId });
       const prior = rows.find(row => row.originFingerprint === finding.episodeId);
-      if (prior) return prior;
+      if (prior) return project(prior);
       const open = rows.find(row => row.status !== 'done' && row.status !== 'cancelled');
-      if (open) return open;
+      if (open) return project(open);
       const latest = rows[0];
       if (latest) {
         if (Date.now() - latest.createdAt.getTime() < 3600000) throw new Error('hourly cap');

@@ -36,6 +36,10 @@ describe('intake guard store — OFFLINE real PostgreSQL', () => {
   it('serializes simultaneous replicas and persists one unassigned owned finding', async () => {
     const results = await Promise.all(Array.from({ length: 8 }, () => store.create(identity, finding())));
     expect(new Set(results.map(row => row.id)).size).toBe(1);
+    for (const row of results) {
+      expect(Object.keys(row).sort()).toEqual(['id', 'identifier', 'title', 'description', 'status',
+        'createdAt', 'assigneeAgentId', 'assigneeUserId'].sort());
+    }
     const rows = await store.list(identity) as any[];
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ status: 'backlog', assigneeAgentId: null, assigneeUserId: null });
