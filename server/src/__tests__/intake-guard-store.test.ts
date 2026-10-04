@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { activityLog, authUsers, companies, companyMemberships, createDb, issues } from '@paperclipai/db';
 import { eq, sql } from 'drizzle-orm';
 import { startEmbeddedPostgresTestDatabase } from './helpers/embedded-postgres.js';
@@ -39,8 +39,15 @@ describe('intake guard store — OFFLINE real PostgreSQL', () => {
     else process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY = originalConfig;
     await temp?.cleanup();
   });
-  it.each(['revoke', 'rotate', 'membership'])('fences a create waiting on company lock after %s', async change => {
-    expect(await store.authorize(identity)).toBe(true);
+  it.each(['create', 'list', 'read'].flatMap(operation =>
+    ['revoke', 'rotate', 'membership', 'expiry'].map(change => [operation, change])))
+  ('fences %s waiting on company lock after %s', async (operation, change) => {
+    const testIdentity = { ...identity, issuedAt: new Date(Date.now() - 1000).toISOString(),
+      expiresAt: new Date(Date.now() + 60000).toISOString() };
+    process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY = JSON.stringify(testIdentity);
+    const row = operation === 'read' ? await store.create(testIdentity, finding()) : null;
+    await db.delete(activityLog);
+    expect(await store.authorize(testIdentity)).toBe(true);
     let release!: () => void; let locked!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     const ready = new Promise<void>(resolve => { locked = resolve; });
@@ -49,7 +56,10 @@ describe('intake guard store — OFFLINE real PostgreSQL', () => {
       locked(); await gate;
     });
     await ready;
-    const pending = store.create(identity, finding()).then(row => ({ row, error: null }), error => ({ row: null, error }));
+    const clock = vi.spyOn(Date, 'now');
+    const work = operation === 'create' ? store.create(testIdentity, finding())
+      : operation === 'list' ? store.list(testIdentity) : store.read(testIdentity, row!.id);
+    const pending = work.then(row => ({ row, error: null }), error => ({ row: null, error }));
     try {
       // Observe PostgreSQL itself, not a guessed delay, before changing authority.
       let waiting = false;
@@ -62,13 +72,50 @@ describe('intake guard store — OFFLINE real PostgreSQL', () => {
       }
       expect(waiting).toBe(true);
       if (change === 'revoke') delete process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY;
-      if (change === 'rotate') process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY = JSON.stringify({ ...identity, credentialVersion: 'offline-v2' });
+      if (change === 'rotate') process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY = JSON.stringify({ ...testIdentity, credentialVersion: 'offline-v2' });
       if (change === 'membership') await db.update(companyMemberships).set({ status: 'inactive' });
-    } finally { release(); await blocker; }
+      if (change === 'expiry') clock.mockReturnValue(Date.parse(testIdentity.expiresAt) + 1);
+    } finally { release(); await blocker; await pending; clock.mockRestore(); }
     const result = await pending;
     expect(result.error).toBeTruthy(); expect(result.row).toBeNull();
-    expect(await db.select().from(issues)).toHaveLength(0);
+    expect(await db.select().from(issues)).toHaveLength(row ? 1 : 0);
     expect(await db.select().from(activityLog)).toHaveLength(0);
+  });
+  it('holds issuer membership through readback COMMIT before revocation can commit', async () => {
+    const row = await store.create(identity, finding());
+    let release!: () => void; let locked!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { locked = resolve; });
+    const blocker = db.transaction(async tx => {
+      await tx.execute(sql`lock table activity_log in access exclusive mode`);
+      locked(); await gate;
+    });
+    await ready;
+    const read = store.read(identity, row.id);
+    const waitForLock = async (query: string) => {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const result = await db.execute(sql`select count(*)::int as n from pg_stat_activity
+          where datname = current_database() and wait_event_type = 'Lock' and query like ${query}`);
+        if (Number(result[0]?.n) > 0) return true;
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      return false;
+    };
+    let revoked = false;
+    let revoke: Promise<unknown> | undefined;
+    try {
+      expect(await waitForLock('%insert into "activity_log"%')).toBe(true);
+      revoke = db.update(companyMemberships).set({ status: 'inactive' }).then(result => {
+        revoked = true; return result;
+      });
+      expect(await waitForLock('%update "company_memberships"%')).toBe(true);
+      expect(revoked).toBe(false);
+    } finally { release(); await blocker; await read; await revoke; }
+    expect(await read).toMatchObject({ id: row.id });
+    expect(revoked).toBe(true);
+    expect((await db.select().from(activityLog)).filter(log => log.action === 'intake_guard.readback')).toHaveLength(1);
+    await expect(store.list(identity)).rejects.toThrow('issuer unavailable');
+    await expect(store.read(identity, row.id)).rejects.toThrow('issuer unavailable');
   });
   it('serializes simultaneous replicas and persists one unassigned owned finding', async () => {
     const results = await Promise.all(Array.from({ length: 8 }, () => store.create(identity, finding())));
