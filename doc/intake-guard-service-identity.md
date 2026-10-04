@@ -50,6 +50,12 @@ Early admission is now mounted before cloud identity assertions, runtime capabil
 
 This proves actual server-process restart and separate persistent HTTP-probe-process restart, not the Mista PR #201 production sampler restart or its local cap/locking logic. That client is still unadapted and belongs to the integration owner. It does not prove a production lifecycle drain, a valid Better Auth board-cookie mix, broad repository checks or an independent review PASS. The targeted process suite returned 1 passed with server typecheck exit 0; no live identity or server was touched.
 
+## Better Auth board-session checkpoint (OFFLINE only)
+
+The createApp suite now uses createBetterAuthInstance, its real handler and resolveBetterAuthSession with migrated disposable PostgreSQL. A real ephemeral sign-up generates a signed session cookie in memory. In all four valid/revoked/expired/malformed pcif cases, the same cookie without pcif authorizes GET company issues (200); no cookie is 401. With pcif, allowed dedicated list/create/readback stay scoped, forbidden general issues/foreign company/comments/wakes/PATCH/auth/webhooks stay 403 or 401, and session/cloud/provider hooks remain uncalled. Only the allowed finding is created; no comments or runs are written. Neither the password nor cookie is persisted or printed. A null-resolver negative control fails all four positive board controls with 401 instead of 200; restoring the resolver passes. The initial fixture mistakenly omitted Host and hit the private hostname guard (403); explicit Host 127.0.0.1 removes that masking. This supersedes the placeholder-cookie gap above, but remains OFFLINE, not live enforcement.
+
+Broader local checks: workspace-link preflight and module-boundary check pass; server build reaches runner binary compilation and fails because cargo is unavailable. That is not a full build PASS. Repository-wide test/typecheck and production sampler integration remain separate gates; independent review must evaluate the new exact head.
+
 ## Evidence and remaining gates
 
 Live GET `/api/health` identified source commit `3549b7821728c2fdbe8fafa2ca10ba3ebc8b3061`, version `2026.930.0+fork.cre804`. The branch is based on that exact commit. The shipped runtime has not been changed.

@@ -13,6 +13,9 @@ vi.mock('../services/cloud-runtime-identity.js', async importOriginal => ({
 }));
 import { createApp } from '../app.js';
 import { createRuntimeToolsToken } from '../runtime-tools-token.js';
+import type { Config } from '../config.js';
+import { createBetterAuthInstance, createBetterAuthHandler, resolveBetterAuthSession } from '../auth/better-auth.js';
+import type { Request } from 'express';
 import { INTAKE_COMPANY_ID } from '../services/intake-guard.js';
 import { createStorageService } from '../storage/service.js';
 import { createLocalDiskStorageProvider } from '../storage/local-disk-provider.js';
@@ -25,7 +28,11 @@ describe('intake guard createApp — OFFLINE', () => {
   let db: ReturnType<typeof createDb>;
   let app: Awaited<ReturnType<typeof createApp>>;
   let root: string;
-  const session = vi.fn(async () => null);
+  let auth: ReturnType<typeof createBetterAuthInstance>;
+  let cookie: string;
+  const origin = 'http://127.0.0.1:41999';
+  const oldBetterSecret = process.env.BETTER_AUTH_SECRET;
+  const session = vi.fn((req: Request) => resolveBetterAuthSession(auth, req));
   const token = ['pcif', 'a'.repeat(64)].join('_');
   const oldConfig = process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY;
   const oldJwt = process.env.PAPERCLIP_AGENT_JWT_SECRET;
@@ -42,12 +49,30 @@ describe('intake guard createApp — OFFLINE', () => {
     await db.insert(authUsers).values({ id: 'offline-app-issuer', name: 'Offline issuer', email: 'offline-app@example.test', createdAt: now, updatedAt: now });
     await db.insert(companies).values({ id: INTAKE_COMPANY_ID, name: 'Offline app', issuePrefix: 'IAT' });
     await db.insert(companyMemberships).values({ companyId: INTAKE_COMPANY_ID, principalType: 'user', principalId: 'offline-app-issuer', status: 'active', membershipRole: 'member' });
+    process.env.BETTER_AUTH_SECRET = randomUUID() + randomUUID();
+    auth = createBetterAuthInstance(db, { deploymentMode: 'authenticated', deploymentExposure: 'private',
+      authBaseUrlMode: 'explicit', authPublicBaseUrl: origin, authDisableSignUp: false,
+      allowedHostnames: ['127.0.0.1'], port: 41999 } as Config, [origin]);
+    // Real Better Auth handler/Drizzle session, no provider or session stub.
+    // Keep ephemeral password/cookie in memory and out of HTTP log assertions.
+    const signup = await auth.handler(new globalThis.Request(origin + '/api/auth/sign-up/email', {
+      method: 'POST', headers: { origin, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'offline-board@example.test', name: 'Offline board', password: randomUUID() }),
+    }));
+    expect(signup.status).toBe(200);
+    const user = (await signup.json()).user;
+    cookie = signup.headers.getSetCookie().filter(value => value.includes('session_token'))
+      .map(value => value.split(';')[0]).join('; ');
+    expect(Boolean(cookie)).toBe(true);
+    await db.insert(companyMemberships).values({ companyId: INTAKE_COMPANY_ID, principalType: 'user',
+      principalId: user.id, status: 'active', membershipRole: 'owner' });
     app = await createApp(db, { uiMode: 'none', serverPort: 0,
       storageService: createStorageService(createLocalDiskStorageProvider(join(root, 'storage'))),
       deploymentMode: 'authenticated', deploymentExposure: 'private', allowedHostnames: ['127.0.0.1'],
       bindHost: '127.0.0.1', authReady: true, companyDeletionEnabled: false,
       localPluginDir: join(root, 'plugins'), managedPluginAutoInstall: [],
-      decisionServiceOptions: { wakeOriginAgent: async () => undefined }, resolveSession: session });
+      decisionServiceOptions: { wakeOriginAgent: async () => undefined }, resolveSession: session,
+      betterAuthHandler: createBetterAuthHandler(auth) });
   }, 45000);
   beforeEach(async () => {
     process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY = JSON.stringify(identity());
@@ -59,6 +84,8 @@ describe('intake guard createApp — OFFLINE', () => {
     if (root) await rm(root, { recursive: true, force: true });
     if (oldConfig === undefined) delete process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY;
     else process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY = oldConfig;
+    if (oldBetterSecret === undefined) delete process.env.BETTER_AUTH_SECRET;
+    else process.env.BETTER_AUTH_SECRET = oldBetterSecret;
     if (oldJwt === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
     else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldJwt;
   });
@@ -92,6 +119,36 @@ describe('intake guard createApp — OFFLINE', () => {
     expect(await db.select().from(issueComments)).toHaveLength(0);
     expect(await db.select().from(heartbeatRuns)).toHaveLength(0);
     expect(hooks.cloud).not.toHaveBeenCalled(); expect(session).not.toHaveBeenCalled();
+  });
+  it.each(['valid', 'revoked', 'expired', 'malformed'])('keeps a real Better Auth board session terminal for %s pcif', async mode => {
+    const boardList = `/api/companies/${INTAKE_COMPANY_ID}/issues`;
+    expect((await request(app).get(boardList).set('Host', '127.0.0.1')).status).toBe(401);
+    expect((await request(app).get(boardList).set('Host', '127.0.0.1').set('Cookie', cookie)).status).toBe(200);
+    expect(session).toHaveBeenCalled();
+    vi.clearAllMocks();
+    if (mode === 'revoked') delete process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY;
+    if (mode === 'expired') process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY = JSON.stringify({ ...identity(), expiresAt: new Date(Date.now() - 1).toISOString() });
+    const bearer = 'Bearer ' + (mode === 'malformed' ? 'pcif_malformed' : token);
+    const expected = mode === 'valid' ? 403 : 401;
+    const mixed = (method: 'get' | 'post' | 'patch', path: string) => request(app)[method](path)
+      .set('Host', '127.0.0.1').set('Cookie', cookie).set('Authorization', bearer).set('Origin', origin);
+    const created = await mixed('post', list).send(payload());
+    expect(created.status).toBe(mode === 'valid' ? 201 : 401);
+    expect((await mixed('get', list)).status).toBe(mode === 'valid' ? 200 : 401);
+    const uuid = mode === 'valid' ? created.body.id : randomUUID();
+    expect((await mixed('get', '/api/intake-guard/findings/' + uuid)).status).toBe(mode === 'valid' ? 200 : 401);
+    for (const path of [boardList, '/api/issues/' + uuid, `/api/companies/${randomUUID()}/intake-guard/findings`]) {
+      expect((await mixed('get', path)).status).toBe(expected);
+    }
+    for (const path of [boardList, '/api/issues/' + uuid + '/comments', '/api/agents/' + randomUUID() + '/wakeup',
+      '/api/auth/sign-in/email', '/api/routine-triggers/public/aaaaaaaaaaaaaaaaaaaaaaaa/fire', '/api/chat-webhooks/slack']) {
+      expect((await mixed('post', path).send({ title: 'Disallowed', body: 'Disallowed' })).status).toBe(expected);
+    }
+    expect((await mixed('patch', '/api/issues/' + uuid).send({ status: 'done', assigneeUserId: 'foreign' })).status).toBe(expected);
+    expect(session).not.toHaveBeenCalled(); expect(hooks.cloud).not.toHaveBeenCalled(); expect(hooks.github).not.toHaveBeenCalled();
+    expect(await db.select().from(issues)).toHaveLength(mode === 'valid' ? 1 : 0);
+    expect(await db.select().from(issueComments)).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(0);
   });
   it.each(['valid', 'revoked', 'expired', 'malformed'])('blocks mixed runtime/cloud/cookie capabilities for %s bearer', async mode => {
     if (mode === 'revoked') delete process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY;
