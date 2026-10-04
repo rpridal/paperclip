@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import type { Request, Response } from 'express';
+import type { Request, Response, RequestHandler } from 'express';
 import type { Db } from '@paperclipai/db';
 import { activityLog, companies, companyMemberships, issues } from '@paperclipai/db';
 import { and, eq, desc, inArray } from 'drizzle-orm';
@@ -91,6 +91,19 @@ export function intakeGuardStore(db: Db): IntakeGuardStore {
       details: { issuerUserId: identity.issuerUserId, credentialVersion: identity.credentialVersion } }); },
   };
 }
+/** Mount before any alternative authentication or provider-side-effect route. */
+export function intakeGuardMiddleware(db: Db, store: IntakeGuardStore = intakeGuardStore(db)): RequestHandler {
+  return async (req, res, next) => {
+    try {
+      if (await handleIntakeGuard(req, res, store)) return;
+    } catch {
+      res.status(503).json({ error: 'Service authorization unavailable' });
+      return;
+    }
+    next();
+  };
+}
+
 /** Terminal authentication lane: never delegate a pcif bearer to ambient board/agent auth. */
 export async function handleIntakeGuard(req: Request, res: Response, store: IntakeGuardStore): Promise<boolean> {
   const header = req.header('authorization') ?? '';
