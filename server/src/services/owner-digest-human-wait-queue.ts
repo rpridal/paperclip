@@ -15,6 +15,15 @@ export async function withOwnerDigestSourceRevision<T>(db: Db,
       eq(issues.id, captured.originIssueId), eq(issues.companyId, captured.companyId),
     )).limit(1).for("share");
     if (!origin) throw new OwnerDigestHumanWaitUnauthorizedError();
+    // Discovery is not authority. Lock the document before any attachment,
+    // matching upsert/delete writers, then revalidate the full joined source.
+    // A planner-selected joined lock order can otherwise invert these locks.
+    const [candidate] = await tx.select({ documentId: documentRevisions.documentId }).from(documentRevisions)
+      .where(and(eq(documentRevisions.id, captured.revisionId), eq(documentRevisions.companyId, captured.companyId))).limit(1);
+    if (!candidate) throw new OwnerDigestHumanWaitUnauthorizedError();
+    const [document] = await tx.select({ id: documents.id }).from(documents)
+      .where(and(eq(documents.id, candidate.documentId), eq(documents.companyId, captured.companyId))).limit(1).for("share");
+    if (!document) throw new OwnerDigestHumanWaitUnauthorizedError();
     const [source] = await tx.select({
       companyId: issueDocuments.companyId, originIssueId: issueDocuments.issueId,
       documentId: documents.id, revisionId: documentRevisions.id, key: issueDocuments.key,
@@ -22,7 +31,7 @@ export async function withOwnerDigestSourceRevision<T>(db: Db,
     }).from(issueDocuments)
       .innerJoin(documents, eq(documents.id, issueDocuments.documentId))
       .innerJoin(documentRevisions, eq(documentRevisions.documentId, documents.id))
-      .where(and(eq(issueDocuments.issueId, captured.originIssueId),
+      .where(and(eq(issueDocuments.issueId, captured.originIssueId), eq(documents.id, document.id),
         eq(issueDocuments.companyId, captured.companyId), eq(documents.companyId, captured.companyId),
         eq(documentRevisions.companyId, captured.companyId), eq(documentRevisions.id, captured.revisionId),
         eq(documents.latestRevisionId, documentRevisions.id),

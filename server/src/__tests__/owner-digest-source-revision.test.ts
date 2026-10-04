@@ -3,6 +3,8 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { companies, createDb, documents, documentRevisions, issueDocuments, issues } from "@paperclipai/db";
 import * as queueModule from "../services/owner-digest-human-wait-queue.js";
+import { documentService } from "../services/documents.js";
+import type { Db } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 describe("dark owner digest source revision", () => {
@@ -71,7 +73,7 @@ describe("dark owner digest source revision", () => {
         : queueModule.withOwnerDigestSourceRevision(db, input, writer)]);
       await vi.waitFor(async () => {
         const waiting = await db.execute(sql`select 1 from pg_stat_activity where ${pid} = any(pg_blocking_pids(pid))
-          and wait_event_type = 'Lock' and (query like 'update "documents"%' or query like '%from "issue_documents"%for share%')`);
+          and wait_event_type = 'Lock' and (query like 'update "documents"%' or query like '%from "documents"%for share%')`);
         expect(waiting).toHaveLength(1);
       }, { timeout: 3_000, interval: 10 });
     } finally {
@@ -84,6 +86,77 @@ describe("dark owner digest source revision", () => {
       expect(writer).not.toHaveBeenCalled();
     }
     await expect(queueModule.withOwnerDigestSourceRevision(db, input, writer)).rejects.toBeInstanceOf(queueModule.OwnerDigestHumanWaitUnauthorizedError);
+  });
+
+  it("serializes with the real document upsert writer without a deadlock", async () => {
+    const input = await fixture();
+    let release!: () => void, ready!: (pid: number) => void, failed!: (error: unknown) => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const held = new Promise<number>((resolve, reject) => { ready = resolve; failed = reject; });
+    const holder = db.transaction(async (tx) => {
+      await tx.update(documents).set({ latestBody: "Writer owns document" }).where(eq(documents.id, input.documentId));
+      const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      ready(Number(backend.pid)); await barrier;
+      return documentService(tx as unknown as Db).upsertIssueDocument({
+        issueId: input.originIssueId, key: "owner-question", format: "markdown",
+        body: "Real writer revision", baseRevisionId: input.revisionId,
+      });
+    });
+    void holder.catch(failed);
+    const writer = vi.fn(async () => "unsafe");
+    let contender: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      const pid = await held;
+      contender = Promise.allSettled([queueModule.withOwnerDigestSourceRevision(db, input, writer)]);
+      await vi.waitFor(async () => {
+        expect(await db.execute(sql`select 1 from pg_stat_activity where ${pid} = any(pg_blocking_pids(pid))
+          and wait_event_type = 'Lock'`)).toHaveLength(1);
+      }, { timeout: 3_000, interval: 10 });
+    } finally {
+      release(); await Promise.allSettled([holder, ...(contender ? [contender] : [])]);
+    }
+    const outcomes = await Promise.allSettled([holder]);
+    expect(outcomes[0].status).toBe("fulfilled");
+    expect((await contender!)[0]).toMatchObject({ status: "rejected", reason: expect.objectContaining({ name: "OwnerDigestHumanWaitUnauthorizedError" }) });
+    expect(writer).not.toHaveBeenCalled();
+    const [document] = await db.select().from(documents).where(eq(documents.id, input.documentId));
+    expect(document.latestBody).toBe("Real writer revision");
+    await queueModule.withOwnerDigestSourceRevision(db, { ...input, revisionId: document.latestRevisionId! }, async (_tx, source) => {
+      expect(source.body).toBe("Real writer revision");
+    });
+  });
+
+  it("serializes with the real document delete writer without a deadlock", async () => {
+    const input = await fixture();
+    let release!: () => void, ready!: (pid: number) => void, failed!: (error: unknown) => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const held = new Promise<number>((resolve, reject) => { ready = resolve; failed = reject; });
+    const holder = db.transaction(async (tx) => {
+      await tx.select().from(documents).where(eq(documents.id, input.documentId)).for("share");
+      const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      ready(Number(backend.pid)); await barrier;
+      return queueModule.withOwnerDigestSourceRevision(tx as unknown as Db, input, async (_inner, source) => source.body);
+    });
+    void holder.catch(failed);
+    let contender: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      const pid = await held;
+      contender = Promise.allSettled([documentService(db).deleteIssueDocument(input.originIssueId, "owner-question")]);
+      await vi.waitFor(async () => {
+        expect(await db.execute(sql`select 1 from pg_stat_activity where ${pid} = any(pg_blocking_pids(pid))
+          and wait_event_type = 'Lock'`)).toHaveLength(1);
+      }, { timeout: 3_000, interval: 10 });
+    } finally {
+      release(); await Promise.allSettled([holder, ...(contender ? [contender] : [])]);
+    }
+    await expect(holder).resolves.toBe("Immutable source");
+    expect((await contender!)[0].status).toBe("fulfilled");
+    expect(await db.select().from(documents).where(eq(documents.id, input.documentId))).toHaveLength(0);
+    expect(await db.select().from(issueDocuments).where(eq(issueDocuments.id, input.linkId))).toHaveLength(0);
+    expect(await db.select().from(documentRevisions).where(eq(documentRevisions.id, input.revisionId))).toHaveLength(0);
+    const writer = vi.fn(async () => "unsafe");
+    await expect(queueModule.withOwnerDigestSourceRevision(db, input, writer)).rejects.toBeInstanceOf(queueModule.OwnerDigestHumanWaitUnauthorizedError);
+    expect(writer).not.toHaveBeenCalled();
   });
 
   it("rolls dependent writes back when the internal operation fails", async () => {
