@@ -20,4 +20,8 @@ No feature activation is provided in this slice. Activation requires a separate 
 
 ## Validation scope
 
-The focused PostgreSQL suite exercises persistence, enqueue retry races, lifecycle race rejection, routing immutability, exact-scope authorization, origin company containment and terminal handling. It does not claim digest delivery, direct ASK prompt rejection, recovery/wake protection or production acceptance. Full repository gates are not asserted by this slice.
+The focused PostgreSQL suite exercises persistence, enqueue retry races, lifecycle race rejection, routing immutability, exact-scope authorization, origin company containment and terminal handling. Lifecycle race tests hold the winning service transition in an uncommitted real transaction, observe the stale session's UPDATE blocked on that backend through pg_blocking_pids, then release the commit barrier. Both cancellation-first and presentation-first are tested; cancellation after a lost CAS must retry against the presented state. Promise start order and pg_sleep do not determine the winner. Removing the status CAS predicate makes both controlled-race tests fail, rather than silently accepting a terminal overwrite.
+
+Migration generation intentionally prunes 0281_snapshot.json when adding 0286_snapshot.json: the established policy in DATABASE.md, Migration snapshots, retains only the newest five full snapshots. Historical snapshots remain in git history; no historical SQL migration or journal entry is deleted. This is generator policy, not a new queue cleanup or rollback action.
+
+The suite does not claim digest delivery, direct ASK prompt rejection, recovery/wake protection or production acceptance. Full repository gates are not asserted by this slice.

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { eq, sql } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   companies,
   createDb,
@@ -68,22 +68,65 @@ describe("owner digest human-wait queue", () => {
     expect(results.filter((row) => !row.duplicate)).toHaveLength(1);
   });
 
-  it("does not overwrite a terminal state with concurrent presentation", async () => {
+  async function raceTransitions(first: "cancel" | "present", stale: "cancel" | "present") {
     const queue = ownerDigestHumanWaitQueueService(db);
-    const racingScope = { kind: "owner_only", questionIds: ["transition-race"] };
+    const racingScope = { kind: "owner_only", questionIds: [`transition-race-${first}`] };
     await authorize(racingScope);
     const row = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: racingScope, producerPrincipalId });
-    await db.$client.unsafe(`CREATE FUNCTION test_queue_update_delay() RETURNS trigger AS $$ BEGIN PERFORM pg_sleep(0.1); RETURN NEW; END; $$ LANGUAGE plpgsql;
-      CREATE TRIGGER test_queue_update_delay BEFORE UPDATE ON owner_digest_human_waits FOR EACH ROW EXECUTE FUNCTION test_queue_update_delay();`);
+    const input = { id: row.id, companyId, producerPrincipalId };
+    let release!: () => void;
+    const commitBarrier = new Promise<void>((resolve) => { release = resolve; });
+    let ready!: (pid: number) => void;
+    let failed!: (error: unknown) => void;
+    const updated = new Promise<number>((resolve, reject) => { ready = resolve; failed = reject; });
+    const winner = db.transaction(async (tx) => {
+      // This service uses only select/insert/update; the transaction provides
+      // those same real Drizzle operations, not a mocked service or connection.
+      const transactionalQueue = ownerDigestHumanWaitQueueService(tx as unknown as typeof db);
+      const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      const result = await transactionalQueue[first](input);
+      ready(Number(backend.pid));
+      await commitBarrier;
+      return result;
+    });
+    void winner.catch(failed);
+    let staleResult: Promise<PromiseSettledResult<unknown>[]> | undefined;
     try {
-      const results = await Promise.allSettled([queue.cancel({ id: row.id, companyId, producerPrincipalId }), queue.present({ id: row.id, companyId, producerPrincipalId })]);
-      expect(results[0].status).toBe("fulfilled");
-      expect(results[1].status).toBe("rejected");
-      const [saved] = await db.select().from(ownerDigestHumanWaits).where(eq(ownerDigestHumanWaits.id, row.id));
-      expect(saved.status).toBe("cancelled");
+      const holderPid = await updated;
+      // The winner has updated but not committed. The other session must read
+      // the old queued version and then block at its real UPDATE/CAS boundary.
+      staleResult = Promise.allSettled([queue[stale](input)]);
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`select 1 from pg_stat_activity
+          where ${holderPid} = any(pg_blocking_pids(pid))
+          and wait_event_type = 'Lock'
+          and query like 'update "owner_digest_human_waits"%'`);
+        expect(waiting).toHaveLength(1);
+      }, { timeout: 3_000, interval: 10 });
     } finally {
-      await db.$client.unsafe("DROP TRIGGER test_queue_update_delay ON owner_digest_human_waits; DROP FUNCTION test_queue_update_delay();");
+      release();
+      // Always finish both sessions, including on an assertion failure.
+      await Promise.allSettled([winner, ...(staleResult ? [staleResult] : [])]);
     }
+    expect(await winner).toMatchObject({ status: first === "cancel" ? "cancelled" : "presented", duplicate: false });
+    expect((await staleResult!)[0]).toMatchObject({
+      status: "rejected", reason: expect.objectContaining({ name: "OwnerDigestHumanWaitTransitionError" }),
+    });
+    const [saved] = await db.select().from(ownerDigestHumanWaits).where(eq(ownerDigestHumanWaits.id, row.id));
+    expect(saved.status).toBe(first === "cancel" ? "cancelled" : "presented");
+    return { queue, input };
+  }
+
+  it("does not overwrite a committed terminal state with stale presentation", async () => {
+    const { queue, input } = await raceTransitions("cancel", "present");
+    await expect(queue.present(input)).rejects.toThrow(/transition/i);
+    expect(await queue.cancel(input)).toMatchObject({ status: "cancelled", duplicate: true });
+  });
+
+  it("allows presentation to commit first and cancellation retry to converge", async () => {
+    const { queue, input } = await raceTransitions("present", "cancel");
+    expect(await queue.cancel(input)).toMatchObject({ status: "cancelled", duplicate: false });
+    await expect(queue.present(input)).rejects.toThrow(/transition/i);
   });
 
   it("keeps routing fields immutable and gives a changed scope a new queue item", async () => {
