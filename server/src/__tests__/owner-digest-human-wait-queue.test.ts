@@ -1,0 +1,133 @@
+import { randomUUID } from "node:crypto";
+import { and, eq } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+  companies,
+  createDb,
+  issues,
+  ownerDigestHumanWaitAuthorizations,
+  ownerDigestHumanWaits,
+} from "@paperclipai/db";
+import {
+  OwnerDigestHumanWaitUnauthorizedError,
+  ownerDigestHumanWaitQueueService,
+} from "../services/owner-digest-human-wait-queue.js";
+import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+
+describe("owner digest human-wait queue", () => {
+  let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let db: ReturnType<typeof createDb>;
+  const scope = { kind: "owner_only", questionIds: ["q-1"] };
+  let companyId: string;
+  let originIssueId: string;
+  let inboxUserId: string;
+  let producerPrincipalId: string;
+
+  beforeAll(async () => {
+    temporary = await startEmbeddedPostgresTestDatabase("owner-digest-human-wait-");
+    db = createDb(temporary.connectionString);
+    companyId = randomUUID();
+    originIssueId = randomUUID();
+    inboxUserId = "owner-fixture";
+    producerPrincipalId = "native-owner-digest-fixture";
+    await db.insert(companies).values({ id: companyId, name: "Queue fixture", issuePrefix: "ODQ" });
+    await db.insert(issues).values({ id: originIssueId, companyId, title: "Human wait", status: "blocked" });
+    await authorize(scope);
+  }, 30_000);
+
+  async function authorize(answerScope: Record<string, unknown>) {
+    await db.insert(ownerDigestHumanWaitAuthorizations).values({
+      companyId, originIssueId, inboxUserId, answerScope, producerPrincipalId,
+    });
+  }
+  afterAll(async () => { await db?.$client.end({ timeout: 0 }); await temporary?.cleanup(); });
+
+  it("persists an authorized wait once and presents it idempotently", async () => {
+    const queue = ownerDigestHumanWaitQueueService(db);
+    const first = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: scope, producerPrincipalId });
+    const duplicate = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: scope, producerPrincipalId });
+    expect(duplicate).toMatchObject({ id: first.id, duplicate: true, status: "queued" });
+    expect(await queue.present({ id: first.id, companyId, producerPrincipalId })).toMatchObject({ status: "presented", duplicate: false });
+    expect(await queue.present({ id: first.id, companyId, producerPrincipalId })).toMatchObject({ status: "presented", duplicate: true });
+  });
+
+  it("coalesces concurrent enqueue without rejecting an authorized retry", async () => {
+    const queue = ownerDigestHumanWaitQueueService(db);
+    const concurrentScope = { kind: "owner_only", questionIds: ["concurrent"] };
+    await authorize(concurrentScope);
+    // Hold inserts briefly so independent PostgreSQL sessions all observe no row.
+    await db.$client.unsafe(`CREATE FUNCTION test_queue_insert_delay() RETURNS trigger AS $$ BEGIN PERFORM pg_sleep(0.1); RETURN NEW; END; $$ LANGUAGE plpgsql;
+      CREATE TRIGGER test_queue_insert_delay BEFORE INSERT ON owner_digest_human_waits FOR EACH ROW EXECUTE FUNCTION test_queue_insert_delay();`);
+    let results;
+    try {
+      results = await Promise.all(Array.from({ length: 8 }, () => queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: concurrentScope, producerPrincipalId })));
+    } finally {
+      await db.$client.unsafe("DROP TRIGGER test_queue_insert_delay ON owner_digest_human_waits; DROP FUNCTION test_queue_insert_delay();");
+    }
+    expect(new Set(results.map((row) => row.id)).size).toBe(1);
+    expect(results.filter((row) => !row.duplicate)).toHaveLength(1);
+  });
+
+  it("does not overwrite a terminal state with concurrent presentation", async () => {
+    const queue = ownerDigestHumanWaitQueueService(db);
+    const racingScope = { kind: "owner_only", questionIds: ["transition-race"] };
+    await authorize(racingScope);
+    const row = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: racingScope, producerPrincipalId });
+    await db.$client.unsafe(`CREATE FUNCTION test_queue_update_delay() RETURNS trigger AS $$ BEGIN PERFORM pg_sleep(0.1); RETURN NEW; END; $$ LANGUAGE plpgsql;
+      CREATE TRIGGER test_queue_update_delay BEFORE UPDATE ON owner_digest_human_waits FOR EACH ROW EXECUTE FUNCTION test_queue_update_delay();`);
+    try {
+      const results = await Promise.allSettled([queue.cancel({ id: row.id, companyId, producerPrincipalId }), queue.present({ id: row.id, companyId, producerPrincipalId })]);
+      expect(results[0].status).toBe("fulfilled");
+      expect(results[1].status).toBe("rejected");
+      const [saved] = await db.select().from(ownerDigestHumanWaits).where(eq(ownerDigestHumanWaits.id, row.id));
+      expect(saved.status).toBe("cancelled");
+    } finally {
+      await db.$client.unsafe("DROP TRIGGER test_queue_update_delay ON owner_digest_human_waits; DROP FUNCTION test_queue_update_delay();");
+    }
+  });
+
+  it("keeps routing fields immutable and gives a changed scope a new queue item", async () => {
+    const queue = ownerDigestHumanWaitQueueService(db);
+    const first = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: scope, producerPrincipalId });
+    const changedScope = { kind: "owner_only", questionIds: ["q-2"] };
+    await authorize(changedScope);
+    const changed = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: changedScope, producerPrincipalId });
+    expect(changed.id).not.toBe(first.id);
+    await expect(db.update(ownerDigestHumanWaits).set({ inboxUserId: "other-owner" }).where(eq(ownerDigestHumanWaits.id, first.id))).rejects.toMatchObject({
+      cause: expect.objectContaining({ message: expect.stringMatching(/immutable/i) }),
+    });
+    const [row] = await db.select().from(ownerDigestHumanWaits).where(eq(ownerDigestHumanWaits.id, first.id));
+    expect(row).toMatchObject({ companyId, originIssueId, inboxUserId, answerScope: scope, status: "presented" });
+  });
+
+  it("rejects changed scope without creating another authorization or queue row", async () => {
+    const queue = ownerDigestHumanWaitQueueService(db);
+    const before = await db.select().from(ownerDigestHumanWaitAuthorizations);
+    await expect(queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: { kind: "owner_only", questionIds: ["unreviewed-change"] }, producerPrincipalId })).rejects.toBeInstanceOf(OwnerDigestHumanWaitUnauthorizedError);
+    expect(await db.select().from(ownerDigestHumanWaitAuthorizations)).toEqual(before);
+  });
+
+  it("rejects cross-company origin even when an invalid binding was seeded", async () => {
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({ id: otherCompanyId, name: "Other", issuePrefix: "OTHER" });
+    await db.insert(ownerDigestHumanWaitAuthorizations).values({ companyId: otherCompanyId, originIssueId, inboxUserId, answerScope: scope, producerPrincipalId });
+    const queue = ownerDigestHumanWaitQueueService(db);
+    await expect(queue.enqueue({ companyId: otherCompanyId, originIssueId, inboxUserId, answerScope: scope, producerPrincipalId })).rejects.toBeInstanceOf(OwnerDigestHumanWaitUnauthorizedError);
+    expect(await db.select().from(ownerDigestHumanWaits).where(eq(ownerDigestHumanWaits.companyId, otherCompanyId))).toHaveLength(0);
+  });
+
+  it("allows only authorized lifecycle mutations and supports answered and cancelled terminals", async () => {
+    const queue = ownerDigestHumanWaitQueueService(db);
+    const answeredScope = { kind: "owner_only", questionIds: ["q-answered"] };
+    await authorize(answeredScope);
+    const answered = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: answeredScope, producerPrincipalId });
+    await expect(queue.answer({ id: answered.id, companyId, producerPrincipalId: "wrong" })).rejects.toBeInstanceOf(OwnerDigestHumanWaitUnauthorizedError);
+    await queue.present({ id: answered.id, companyId, producerPrincipalId });
+    expect(await queue.answer({ id: answered.id, companyId, producerPrincipalId })).toMatchObject({ status: "answered" });
+    const cancelledScope = { kind: "owner_only", questionIds: ["q-cancelled"] };
+    await authorize(cancelledScope);
+    const cancelled = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: cancelledScope, producerPrincipalId });
+    expect(await queue.cancel({ id: cancelled.id, companyId, producerPrincipalId })).toMatchObject({ status: "cancelled" });
+    await expect(queue.present({ id: cancelled.id, companyId, producerPrincipalId })).rejects.toThrow(/transition/i);
+  });
+});
