@@ -37,6 +37,8 @@ export const ownerDigestHumanWaits = pgTable(
     inboxUserId: text("inbox_user_id").notNull(),
     answerScope: jsonb("answer_scope").$type<Record<string, unknown>>().notNull(),
     producerPrincipalId: text("producer_principal_id").notNull(),
+    // Null for the earlier dark foundation. A server-only binding sets it once.
+    askIssueId: uuid("ask_issue_id").references(() => issues.id),
     status: text("status").notNull().default("queued"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     presentedAt: timestamp("presented_at", { withTimezone: true }),
@@ -48,6 +50,8 @@ export const ownerDigestHumanWaits = pgTable(
     identityUq: uniqueIndex("owner_digest_human_wait_identity_uq").on(
       table.companyId, table.originIssueId, table.inboxUserId, sql`md5(${table.answerScope}::text)`,
     ),
+    askCarrierUq: uniqueIndex("owner_digest_human_wait_ask_uq").on(table.askIssueId),
+    distinctAskCheck: check("owner_digest_human_wait_distinct_ask_check", sql`${table.askIssueId} IS NULL OR ${table.askIssueId} <> ${table.originIssueId}`),
     queuedIdx: index("owner_digest_human_wait_queued_idx").on(table.companyId, table.status, table.createdAt),
     versionCheck: check("owner_digest_human_wait_version_check", sql`${table.version} = '1'`),
     kindCheck: check("owner_digest_human_wait_kind_check", sql`${table.kind} = 'owner_digest'`),

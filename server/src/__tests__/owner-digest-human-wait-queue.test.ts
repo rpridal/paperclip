@@ -5,6 +5,8 @@ import {
   companies,
   createDb,
   issues,
+  issueRelations,
+  issueThreadInteractions,
   ownerDigestHumanWaitAuthorizations,
   ownerDigestHumanWaits,
 } from "@paperclipai/db";
@@ -41,6 +43,72 @@ describe("owner digest human-wait queue", () => {
     });
   }
   afterAll(async () => { await db?.$client.end({ timeout: 0 }); await temporary?.cleanup(); });
+
+  async function carrierFixture(label: string) {
+    const answerScope = { kind: "owner_only", questionIds: [label] };
+    await authorize(answerScope);
+    const queue = ownerDigestHumanWaitQueueService(db);
+    const row = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope, producerPrincipalId });
+    const askIssueId = randomUUID();
+    // Identity comes from the binding, deliberately not from an ASK title.
+    await db.insert(issues).values({ id: askIssueId, companyId, title: "Untitled carrier", status: "todo" });
+    await db.insert(issueRelations).values({ companyId, issueId: askIssueId, relatedIssueId: originIssueId, type: "blocks" });
+    return { queue, row, askIssueId, input: { id: row.id, companyId, producerPrincipalId, askIssueId } };
+  }
+
+  it("binds one distinct ASK carrier idempotently without changing the blocked origin", async () => {
+    const { queue, row, askIssueId, input } = await carrierFixture("carrier");
+    const first = await queue.bindAsk(input);
+    expect(first).toMatchObject({ id: row.id, askIssueId, status: "queued", duplicate: false });
+    expect(await queue.bindAsk(input)).toMatchObject({ id: row.id, askIssueId, duplicate: true });
+    const [origin] = await db.select().from(issues).where(eq(issues.id, originIssueId));
+    expect(origin.status).toBe("blocked");
+    const [ask] = await db.select().from(issues).where(eq(issues.id, askIssueId));
+    expect(ask).toMatchObject({ status: "todo", assigneeAgentId: null });
+  });
+
+  it.each(["foreign", "no-edge", "pending", "answered", "active"] as const)("rejects unsafe carrier %s without rewriting legacy interactions", async (reason) => {
+    const { queue, row, askIssueId, input } = await carrierFixture(`unsafe-${reason}`);
+    if (reason === "foreign") {
+      const foreign = randomUUID();
+      await db.insert(companies).values({ id: foreign, name: "Foreign carrier", issuePrefix: "FC" });
+      await db.update(issues).set({ companyId: foreign }).where(eq(issues.id, askIssueId));
+    }
+    if (reason === "no-edge") await db.delete(issueRelations).where(eq(issueRelations.issueId, askIssueId));
+    if (reason === "active") await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, askIssueId));
+    if (reason === "pending" || reason === "answered") await db.insert(issueThreadInteractions).values({ companyId, issueId: askIssueId, kind: "request_confirmation", status: reason === "pending" ? "pending" : "resolved", payload: {} });
+    const before = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, askIssueId));
+    await expect(queue.bindAsk(input)).rejects.toBeInstanceOf(OwnerDigestHumanWaitUnauthorizedError);
+    const [saved] = await db.select().from(ownerDigestHumanWaits).where(eq(ownerDigestHumanWaits.id, row.id));
+    expect(saved.askIssueId).toBeNull();
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, askIssueId))).toEqual(before);
+  });
+
+  it("never rebinds an ASK carrier, even through a direct database edit", async () => {
+    const { queue, row, input } = await carrierFixture("immutable-carrier");
+    await queue.bindAsk(input);
+    const other = randomUUID();
+    await db.insert(issues).values({ id: other, companyId, title: "Other", status: "todo" });
+    await expect(db.update(ownerDigestHumanWaits).set({ askIssueId: other }).where(eq(ownerDigestHumanWaits.id, row.id))).rejects.toMatchObject({ cause: expect.objectContaining({ message: expect.stringMatching(/immutable/i) }) });
+  });
+
+  it("does not accept caller supplied carrier identity during enqueue", async () => {
+    const answerScope = { kind: "owner_only", questionIds: ["enqueue-carrier-bypass"] };
+    await authorize(answerScope);
+    const askIssueId = randomUUID();
+    await db.insert(issues).values({ id: askIssueId, companyId, title: "Unbound", status: "todo" });
+    const queue = ownerDigestHumanWaitQueueService(db);
+    const untypedInput = { companyId, originIssueId, inboxUserId, answerScope, producerPrincipalId, askIssueId };
+    expect(await queue.enqueue(untypedInput)).toMatchObject({ askIssueId: null });
+  });
+
+  it("serializes concurrent carrier bindings and refuses replacing the winner", async () => {
+    const { queue, askIssueId, input } = await carrierFixture("concurrent-carrier");
+    const results = await Promise.all(Array.from({ length: 8 }, () => queue.bindAsk(input)));
+    expect(results.filter((result) => !result.duplicate)).toHaveLength(1);
+    expect(results.every((result) => result.askIssueId === askIssueId)).toBe(true);
+    await expect(queue.bindAsk({ ...input, askIssueId: originIssueId })).rejects.toThrow(/transition/i);
+  });
 
   it("persists an authorized wait once and presents it idempotently", async () => {
     const queue = ownerDigestHumanWaitQueueService(db);

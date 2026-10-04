@@ -1,6 +1,6 @@
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issues, ownerDigestHumanWaitAuthorizations, ownerDigestHumanWaits } from "@paperclipai/db";
+import { issues, issueRelations, issueThreadInteractions, ownerDigestHumanWaitAuthorizations, ownerDigestHumanWaits } from "@paperclipai/db";
 
 type AnswerScope = Record<string, unknown>;
 type WaitRow = typeof ownerDigestHumanWaits.$inferSelect;
@@ -61,6 +61,25 @@ function queueWithinTransaction(db: Db) {
   }
 
   return {
+    async bindAsk(input: { id: string; companyId: string; producerPrincipalId: string; askIssueId: string }) {
+      await rowAndAuthorize(input);
+      const [row] = await db.select().from(ownerDigestHumanWaits).where(eq(ownerDigestHumanWaits.id, input.id)).limit(1).for("update");
+      if (row.askIssueId === input.askIssueId) return { ...row, duplicate: true };
+      if (row.askIssueId || row.status !== "queued") throw new OwnerDigestHumanWaitTransitionError();
+      if (input.askIssueId === row.originIssueId) throw new OwnerDigestHumanWaitUnauthorizedError();
+      const [origin] = await db.select().from(issues).where(eq(issues.id, row.originIssueId)).limit(1);
+      const [ask] = await db.select().from(issues).where(and(eq(issues.id, input.askIssueId), eq(issues.companyId, row.companyId))).limit(1).for("update");
+      if (origin.status !== "blocked" || !ask || ask.status !== "todo" || ask.assigneeAgentId || ask.assigneeUserId || ask.checkoutRunId || ask.executionRunId) throw new OwnerDigestHumanWaitUnauthorizedError();
+      const [edge] = await db.select({ id: issueRelations.id }).from(issueRelations).where(and(
+        eq(issueRelations.companyId, row.companyId), eq(issueRelations.issueId, ask.id),
+        eq(issueRelations.relatedIssueId, row.originIssueId), eq(issueRelations.type, "blocks"),
+      )).limit(1).for("share");
+      const [interaction] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, ask.id)).limit(1);
+      if (!edge || interaction) throw new OwnerDigestHumanWaitUnauthorizedError();
+      const [bound] = await db.update(ownerDigestHumanWaits).set({ askIssueId: input.askIssueId, updatedAt: new Date() })
+        .where(eq(ownerDigestHumanWaits.id, row.id)).returning();
+      return { ...bound, duplicate: false };
+    },
     async enqueue(input: { companyId: string; originIssueId: string; inboxUserId: string; answerScope: AnswerScope; producerPrincipalId: string }) {
       await authorized(input);
       const [existing] = await db.select().from(ownerDigestHumanWaits).where(and(
@@ -68,7 +87,11 @@ function queueWithinTransaction(db: Db) {
         eq(ownerDigestHumanWaits.inboxUserId, input.inboxUserId), sameScope(ownerDigestHumanWaits.answerScope, input.answerScope),
       )).limit(1);
       if (existing) return { ...existing, duplicate: true };
-      const [created] = await db.insert(ownerDigestHumanWaits).values(input).onConflictDoNothing().returning();
+      const [created] = await db.insert(ownerDigestHumanWaits).values({
+        companyId: input.companyId, originIssueId: input.originIssueId,
+        inboxUserId: input.inboxUserId, answerScope: input.answerScope,
+        producerPrincipalId: input.producerPrincipalId,
+      }).onConflictDoNothing().returning();
       if (created) return { ...created, duplicate: false };
       const [winner] = await db.select().from(ownerDigestHumanWaits).where(and(
         eq(ownerDigestHumanWaits.companyId, input.companyId), eq(ownerDigestHumanWaits.originIssueId, input.originIssueId),
@@ -95,6 +118,7 @@ export function ownerDigestHumanWaitQueueService(db: Db) {
     });
   }
   return {
+    bindAsk: (input: Parameters<Queue["bindAsk"]>[0]) => atomic((queue) => queue.bindAsk(input)),
     enqueue: (input: Parameters<Queue["enqueue"]>[0]) => atomic((queue) => queue.enqueue(input)),
     present: (input: Parameters<Queue["present"]>[0]) => atomic((queue) => queue.present(input)),
     answer: (input: Parameters<Queue["answer"]>[0]) => atomic((queue) => queue.answer(input)),
