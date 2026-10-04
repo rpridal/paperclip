@@ -1,6 +1,25 @@
 import { and, eq, sql } from "drizzle-orm";
+import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { issues, issueRelations, issueThreadInteractions, ownerDigestHumanWaitAuthorizations, ownerDigestHumanWaits } from "@paperclipai/db";
+
+// Dark internal syntax only, not audience authorization or an approval grant.
+// Categories match the existing owner-digest producer's reserved owner scopes.
+const answerScopeV1 = z.object({
+  version: z.literal(1),
+  kind: z.literal("owner_only"),
+  approvalScope: z.enum(["personal_account", "personal_credentials", "money", "irreversible_delete", "host_decommission_with_data"]),
+  revisionId: z.string().uuid(),
+  questionIds: z.array(z.string().regex(/^\S+$/)).min(1)
+    .refine((ids) => new Set(ids).size === ids.length),
+}).strict();
+
+function captureAnswerScope(scope: AnswerScope) {
+  const result = answerScopeV1.safeParse(scope);
+  if (!result.success) throw new OwnerDigestHumanWaitUnauthorizedError();
+  // Zod clones nested arrays; no caller reference survives an async boundary.
+  return result.data;
+}
 
 type AnswerScope = Record<string, unknown>;
 type WaitRow = typeof ownerDigestHumanWaits.$inferSelect;
@@ -19,6 +38,9 @@ function sameScope(column: typeof ownerDigestHumanWaits.answerScope | typeof own
 
 function queueWithinTransaction(db: Db) {
   async function authorized(input: { companyId: string; originIssueId: string; inboxUserId: string; answerScope: AnswerScope; producerPrincipalId: string }) {
+    // Reject, never trim/coerce/default or upgrade an opaque legacy scope.
+    // The exact original JSONB remains the immutable authorization identity.
+    if (!answerScopeV1.safeParse(input.answerScope).success) throw new OwnerDigestHumanWaitUnauthorizedError();
     // SHARE permits concurrent producers but orders origin edits and binding
     // revocation against this operation's commit, including duplicate retries.
     const [origin] = await db.select({ id: issues.id }).from(issues).where(and(eq(issues.id, input.originIssueId), eq(issues.companyId, input.companyId))).limit(1).for("share");
@@ -119,7 +141,10 @@ export function ownerDigestHumanWaitQueueService(db: Db) {
   }
   return {
     bindAsk: (input: Parameters<Queue["bindAsk"]>[0]) => atomic((queue) => queue.bindAsk(input)),
-    enqueue: (input: Parameters<Queue["enqueue"]>[0]) => atomic((queue) => queue.enqueue(input)),
+    enqueue: async (input: Parameters<Queue["enqueue"]>[0]) => {
+      const captured = { ...input, answerScope: captureAnswerScope(input.answerScope) };
+      return atomic((queue) => queue.enqueue(captured));
+    },
     present: (input: Parameters<Queue["present"]>[0]) => atomic((queue) => queue.present(input)),
     answer: (input: Parameters<Queue["answer"]>[0]) => atomic((queue) => queue.answer(input)),
     cancel: (input: Parameters<Queue["cancel"]>[0]) => atomic((queue) => queue.cancel(input)),

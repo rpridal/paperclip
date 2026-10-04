@@ -19,7 +19,8 @@ import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.j
 describe("owner digest human-wait queue", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
-  const scope = { kind: "owner_only", questionIds: ["q-1"] };
+  const scopeIdentity = { version: 1, approvalScope: "personal_account", revisionId: randomUUID() };
+  const scope = { ...scopeIdentity, kind: "owner_only", questionIds: ["q-1"] };
   let companyId: string;
   let originIssueId: string;
   let inboxUserId: string;
@@ -45,7 +46,7 @@ describe("owner digest human-wait queue", () => {
   afterAll(async () => { await db?.$client.end({ timeout: 0 }); await temporary?.cleanup(); });
 
   async function carrierFixture(label: string) {
-    const answerScope = { kind: "owner_only", questionIds: [label] };
+    const answerScope = { ...scopeIdentity, kind: "owner_only", questionIds: [label] };
     await authorize(answerScope);
     const queue = ownerDigestHumanWaitQueueService(db);
     const row = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope, producerPrincipalId });
@@ -93,7 +94,7 @@ describe("owner digest human-wait queue", () => {
   });
 
   it("does not accept caller supplied carrier identity during enqueue", async () => {
-    const answerScope = { kind: "owner_only", questionIds: ["enqueue-carrier-bypass"] };
+    const answerScope = { ...scopeIdentity, kind: "owner_only", questionIds: ["enqueue-carrier-bypass"] };
     await authorize(answerScope);
     const askIssueId = randomUUID();
     await db.insert(issues).values({ id: askIssueId, companyId, title: "Unbound", status: "todo" });
@@ -121,7 +122,7 @@ describe("owner digest human-wait queue", () => {
 
   it("coalesces concurrent enqueue without rejecting an authorized retry", async () => {
     const queue = ownerDigestHumanWaitQueueService(db);
-    const concurrentScope = { kind: "owner_only", questionIds: ["concurrent"] };
+    const concurrentScope = { ...scopeIdentity, kind: "owner_only", questionIds: ["concurrent"] };
     await authorize(concurrentScope);
     // Hold inserts briefly so independent PostgreSQL sessions all observe no row.
     await db.$client.unsafe(`CREATE FUNCTION test_queue_insert_delay() RETURNS trigger AS $$ BEGIN PERFORM pg_sleep(0.1); RETURN NEW; END; $$ LANGUAGE plpgsql;
@@ -138,7 +139,7 @@ describe("owner digest human-wait queue", () => {
 
   async function raceTransitions(first: "cancel" | "present", stale: "cancel" | "present") {
     const queue = ownerDigestHumanWaitQueueService(db);
-    const racingScope = { kind: "owner_only", questionIds: [`transition-race-${first}`] };
+    const racingScope = { ...scopeIdentity, kind: "owner_only", questionIds: [`transition-race-${first}`] };
     await authorize(racingScope);
     const row = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: racingScope, producerPrincipalId });
     const input = { id: row.id, companyId, producerPrincipalId };
@@ -200,7 +201,7 @@ describe("owner digest human-wait queue", () => {
   it("keeps routing fields immutable and gives a changed scope a new queue item", async () => {
     const queue = ownerDigestHumanWaitQueueService(db);
     const first = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: scope, producerPrincipalId });
-    const changedScope = { kind: "owner_only", questionIds: ["q-2"] };
+    const changedScope = { ...scopeIdentity, kind: "owner_only", questionIds: ["q-2"] };
     await authorize(changedScope);
     const changed = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: changedScope, producerPrincipalId });
     expect(changed.id).not.toBe(first.id);
@@ -211,16 +212,100 @@ describe("owner digest human-wait queue", () => {
     expect(row).toMatchObject({ companyId, originIssueId, inboxUserId, answerScope: scope, status: "presented" });
   });
 
+  it.each([
+    ["unversioned", { version: undefined }],
+    ["future-version", { version: 2 }],
+    ["technical", { approvalScope: "deploy" }],
+    ["unknown-audience", { kind: "board" }],
+    ["empty-questions", { questionIds: [] }],
+    ["duplicate-questions", { questionIds: ["same", "same"] }],
+    ["whitespace-id", { questionIds: [" q-1"] }],
+    ["missing-revision", { revisionId: undefined }],
+    ["bad-revision", { revisionId: "latest" }],
+    ["caller-bypass", { authorized: true }],
+  ] as const)("rejects invalid native scope %s even with an exact ledger row", async (label, delta) => {
+    const answerScope = JSON.parse(JSON.stringify({ ...scope, questionIds: [`invalid-${label}`], ...delta }));
+    await authorize(answerScope);
+    const before = await db.select().from(ownerDigestHumanWaits);
+    const bindings = await db.select().from(ownerDigestHumanWaitAuthorizations);
+    const queue = ownerDigestHumanWaitQueueService(db);
+    await expect(queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope, producerPrincipalId }))
+      .rejects.toBeInstanceOf(OwnerDigestHumanWaitUnauthorizedError);
+    expect(await db.select().from(ownerDigestHumanWaits)).toEqual(before);
+    expect(await db.select().from(ownerDigestHumanWaitAuthorizations)).toEqual(bindings);
+  });
+
+  it("does not upgrade opaque legacy scope or mutate its lifecycle", async () => {
+    const answerScope = { kind: "owner_only", questionIds: ["legacy-opaque"] };
+    await authorize(answerScope);
+    const [row] = await db.insert(ownerDigestHumanWaits).values({ companyId, originIssueId, inboxUserId, answerScope, producerPrincipalId }).returning();
+    const queue = ownerDigestHumanWaitQueueService(db);
+    await expect(queue.present({ id: row.id, companyId, producerPrincipalId })).rejects.toBeInstanceOf(OwnerDigestHumanWaitUnauthorizedError);
+    expect(await db.select().from(ownerDigestHumanWaits).where(eq(ownerDigestHumanWaits.id, row.id))).toEqual([row]);
+  });
+
+  it("snapshots validated scope before awaiting origin authorization locks", async () => {
+    const answerScope = { ...scope, questionIds: ["scope-input-race"] };
+    const original = structuredClone(answerScope);
+    await authorize(original);
+    await authorize({ ...original, approvalScope: "deploy" });
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    let ready!: (pid: number) => void;
+    let failed!: (error: unknown) => void;
+    const locked = new Promise<number>((resolve, reject) => { ready = resolve; failed = reject; });
+    const holder = db.transaction(async (tx) => {
+      const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      await tx.update(issues).set({ title: "Human wait" }).where(eq(issues.id, originIssueId));
+      ready(Number(backend.pid));
+      await barrier;
+    });
+    void holder.catch(failed);
+    let attempt: ReturnType<ReturnType<typeof ownerDigestHumanWaitQueueService>["enqueue"]> | undefined;
+    try {
+      const holderPid = await locked;
+      attempt = ownerDigestHumanWaitQueueService(db).enqueue({ companyId, originIssueId, inboxUserId, answerScope, producerPrincipalId });
+      void attempt.catch(() => {});
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`select 1 from pg_stat_activity
+          where ${holderPid} = any(pg_blocking_pids(pid)) and wait_event_type = 'Lock'`);
+        expect(waiting).toHaveLength(1);
+      }, { timeout: 3_000, interval: 10 });
+      // Mutate the original caller object only after the real service has
+      // validated it and is measurably suspended on the origin row lock.
+      answerScope.approvalScope = "deploy";
+    } finally {
+      release();
+      await Promise.allSettled([holder, ...(attempt ? [attempt] : [])]);
+    }
+    expect(await attempt!).toMatchObject({ answerScope: original });
+  });
+
+  it("rejects changed revision without reusing the previous binding", async () => {
+    const answerScope = { ...scope, revisionId: randomUUID() };
+    const before = await db.select().from(ownerDigestHumanWaits);
+    await expect(ownerDigestHumanWaitQueueService(db).enqueue({ companyId, originIssueId, inboxUserId, answerScope, producerPrincipalId }))
+      .rejects.toBeInstanceOf(OwnerDigestHumanWaitUnauthorizedError);
+    expect(await db.select().from(ownerDigestHumanWaits)).toEqual(before);
+  });
+
+  it.each(["personal_account", "personal_credentials", "money", "irreversible_delete", "host_decommission_with_data"])("preserves reserved owner classification %s without granting permission", async (approvalScope) => {
+    const answerScope = { ...scope, approvalScope, questionIds: [`positive-${approvalScope}`] };
+    await authorize(answerScope);
+    expect(await ownerDigestHumanWaitQueueService(db).enqueue({ companyId, originIssueId, inboxUserId, answerScope, producerPrincipalId }))
+      .toMatchObject({ answerScope, status: "queued" });
+  });
+
   it("rejects changed scope without creating another authorization or queue row", async () => {
     const queue = ownerDigestHumanWaitQueueService(db);
     const before = await db.select().from(ownerDigestHumanWaitAuthorizations);
-    await expect(queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: { kind: "owner_only", questionIds: ["unreviewed-change"] }, producerPrincipalId })).rejects.toBeInstanceOf(OwnerDigestHumanWaitUnauthorizedError);
+    await expect(queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: { ...scopeIdentity, kind: "owner_only", questionIds: ["unreviewed-change"] }, producerPrincipalId })).rejects.toBeInstanceOf(OwnerDigestHumanWaitUnauthorizedError);
     expect(await db.select().from(ownerDigestHumanWaitAuthorizations)).toEqual(before);
   });
 
   it.each(["enqueue", "present"] as const)("rejects %s when an overlapping binding revocation commits first", async (operation) => {
     const queue = ownerDigestHumanWaitQueueService(db);
-    const revokedScope = { kind: "owner_only", questionIds: [`revoked-${operation}`] };
+    const revokedScope = { ...scopeIdentity, kind: "owner_only", questionIds: [`revoked-${operation}`] };
     await authorize(revokedScope);
     const input = { companyId, originIssueId, inboxUserId, answerScope: revokedScope, producerPrincipalId };
     const queued = operation === "present" ? await queue.enqueue(input) : undefined;
@@ -265,7 +350,7 @@ describe("owner digest human-wait queue", () => {
 
   it("orders revocation after a mutation commit and denies subsequent duplicate retries", async () => {
     const queue = ownerDigestHumanWaitQueueService(db);
-    const answerScope = { kind: "owner_only", questionIds: ["mutation-first"] };
+    const answerScope = { ...scopeIdentity, kind: "owner_only", questionIds: ["mutation-first"] };
     await authorize(answerScope);
     const row = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope, producerPrincipalId });
     const input = { id: row.id, companyId, producerPrincipalId };
@@ -318,13 +403,13 @@ describe("owner digest human-wait queue", () => {
 
   it("allows only authorized lifecycle mutations and supports answered and cancelled terminals", async () => {
     const queue = ownerDigestHumanWaitQueueService(db);
-    const answeredScope = { kind: "owner_only", questionIds: ["q-answered"] };
+    const answeredScope = { ...scopeIdentity, kind: "owner_only", questionIds: ["q-answered"] };
     await authorize(answeredScope);
     const answered = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: answeredScope, producerPrincipalId });
     await expect(queue.answer({ id: answered.id, companyId, producerPrincipalId: "wrong" })).rejects.toBeInstanceOf(OwnerDigestHumanWaitUnauthorizedError);
     await queue.present({ id: answered.id, companyId, producerPrincipalId });
     expect(await queue.answer({ id: answered.id, companyId, producerPrincipalId })).toMatchObject({ status: "answered" });
-    const cancelledScope = { kind: "owner_only", questionIds: ["q-cancelled"] };
+    const cancelledScope = { ...scopeIdentity, kind: "owner_only", questionIds: ["q-cancelled"] };
     await authorize(cancelledScope);
     const cancelled = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope: cancelledScope, producerPrincipalId });
     expect(await queue.cancel({ id: cancelled.id, companyId, producerPrincipalId })).toMatchObject({ status: "cancelled" });
