@@ -1,7 +1,40 @@
 import { and, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
-import { issues, issueRelations, issueThreadInteractions, ownerDigestHumanWaitAuthorizations, ownerDigestHumanWaits } from "@paperclipai/db";
+import { documents, documentRevisions, issueDocuments, issues, issueRelations, issueThreadInteractions, ownerDigestHumanWaitAuthorizations, ownerDigestHumanWaits } from "@paperclipai/db";
+
+/** Dark source identity only. No audience, permission or question-set authority. */
+export async function withOwnerDigestSourceRevision<T>(db: Db,
+  input: { companyId: string; originIssueId: string; revisionId: string },
+  operation: (tx: Db, source: { companyId: string; originIssueId: string; documentId: string;
+    revisionId: string; key: string; body: string; format: string; revisionNumber: number }) => Promise<T>,
+): Promise<T> {
+  const captured = { companyId: input.companyId, originIssueId: input.originIssueId, revisionId: input.revisionId };
+  return db.transaction(async (tx) => {
+    const [origin] = await tx.select({ id: issues.id }).from(issues).where(and(
+      eq(issues.id, captured.originIssueId), eq(issues.companyId, captured.companyId),
+    )).limit(1).for("share");
+    if (!origin) throw new OwnerDigestHumanWaitUnauthorizedError();
+    const [source] = await tx.select({
+      companyId: issueDocuments.companyId, originIssueId: issueDocuments.issueId,
+      documentId: documents.id, revisionId: documentRevisions.id, key: issueDocuments.key,
+      body: documentRevisions.body, format: documentRevisions.format, revisionNumber: documentRevisions.revisionNumber,
+    }).from(issueDocuments)
+      .innerJoin(documents, eq(documents.id, issueDocuments.documentId))
+      .innerJoin(documentRevisions, eq(documentRevisions.documentId, documents.id))
+      .where(and(eq(issueDocuments.issueId, captured.originIssueId),
+        eq(issueDocuments.companyId, captured.companyId), eq(documents.companyId, captured.companyId),
+        eq(documentRevisions.companyId, captured.companyId), eq(documentRevisions.id, captured.revisionId),
+        eq(documents.latestRevisionId, documentRevisions.id),
+        eq(documents.latestBody, documentRevisions.body), eq(documents.format, documentRevisions.format),
+        eq(documents.latestRevisionNumber, documentRevisions.revisionNumber)))
+      .limit(1).for("share");
+    if (!source) throw new OwnerDigestHumanWaitUnauthorizedError();
+    // Locks and dependent writes share one commit; returning an ID alone would
+    // lose the current-revision guarantee before a later enqueue/presentation.
+    return operation(tx as unknown as Db, source);
+  });
+}
 
 // Dark internal syntax only, not audience authorization or an approval grant.
 // Categories match the existing owner-digest producer's reserved owner scopes.
