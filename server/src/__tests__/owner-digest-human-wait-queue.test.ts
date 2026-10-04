@@ -150,6 +150,95 @@ describe("owner digest human-wait queue", () => {
     expect(await db.select().from(ownerDigestHumanWaitAuthorizations)).toEqual(before);
   });
 
+  it.each(["enqueue", "present"] as const)("rejects %s when an overlapping binding revocation commits first", async (operation) => {
+    const queue = ownerDigestHumanWaitQueueService(db);
+    const revokedScope = { kind: "owner_only", questionIds: [`revoked-${operation}`] };
+    await authorize(revokedScope);
+    const input = { companyId, originIssueId, inboxUserId, answerScope: revokedScope, producerPrincipalId };
+    const queued = operation === "present" ? await queue.enqueue(input) : undefined;
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    let ready!: (pid: number) => void;
+    let failed!: (error: unknown) => void;
+    const deleted = new Promise<number>((resolve, reject) => { ready = resolve; failed = reject; });
+    const revocation = db.transaction(async (tx) => {
+      const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      await tx.execute(sql`delete from owner_digest_human_wait_authorizations
+        where company_id = ${companyId} and answer_scope = ${JSON.stringify(revokedScope)}::jsonb`);
+      ready(Number(backend.pid));
+      await barrier;
+    });
+    void revocation.catch(failed);
+    let attempt: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    let settled = false;
+    try {
+      const holderPid = await deleted;
+      attempt = Promise.allSettled([operation === "enqueue" ? queue.enqueue(input)
+        : queue.present({ id: queued!.id, companyId, producerPrincipalId })]);
+      void attempt.then(() => { settled = true; });
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`select 1 from pg_stat_activity
+          where ${holderPid} = any(pg_blocking_pids(pid)) and wait_event_type = 'Lock'`);
+        // The unsafe baseline may finish before DELETE commits. That is a
+        // measured violation, not an assumption about Promise invocation order.
+        expect(settled || waiting.length === 1).toBe(true);
+      }, { timeout: 3_000, interval: 10 });
+    } finally {
+      release();
+      await Promise.allSettled([revocation, ...(attempt ? [attempt] : [])]);
+    }
+    await revocation;
+    expect((await attempt!)[0]).toMatchObject({ status: "rejected",
+      reason: expect.objectContaining({ name: "OwnerDigestHumanWaitUnauthorizedError" }) });
+    const rows = await db.select().from(ownerDigestHumanWaits).where(eq(ownerDigestHumanWaits.answerScope, revokedScope));
+    if (operation === "enqueue") expect(rows).toHaveLength(0);
+    else expect(rows).toMatchObject([{ id: queued!.id, status: "queued", presentedAt: null }]);
+  });
+
+  it("orders revocation after a mutation commit and denies subsequent duplicate retries", async () => {
+    const queue = ownerDigestHumanWaitQueueService(db);
+    const answerScope = { kind: "owner_only", questionIds: ["mutation-first"] };
+    await authorize(answerScope);
+    const row = await queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope, producerPrincipalId });
+    const input = { id: row.id, companyId, producerPrincipalId };
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    let ready!: (pid: number) => void;
+    let failed!: (error: unknown) => void;
+    const updated = new Promise<number>((resolve, reject) => { ready = resolve; failed = reject; });
+    const mutation = db.transaction(async (tx) => {
+      const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      const result = await ownerDigestHumanWaitQueueService(tx as unknown as typeof db).present(input);
+      ready(Number(backend.pid));
+      await barrier;
+      return result;
+    });
+    void mutation.catch(failed);
+    let revocation: Promise<unknown> | undefined;
+    try {
+      const holderPid = await updated;
+      revocation = db.execute(sql`delete from owner_digest_human_wait_authorizations
+        where company_id = ${companyId} and answer_scope = ${JSON.stringify(answerScope)}::jsonb`).then((result) => result);
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`select 1 from pg_stat_activity
+          where ${holderPid} = any(pg_blocking_pids(pid)) and wait_event_type = 'Lock'
+          and query like 'delete from owner_digest_human_wait_authorizations%'`);
+        expect(waiting).toHaveLength(1);
+      }, { timeout: 3_000, interval: 10 });
+    } finally {
+      release();
+      await Promise.allSettled([mutation, ...(revocation ? [revocation] : [])]);
+    }
+    expect(await mutation).toMatchObject({ status: "presented", duplicate: false });
+    await revocation;
+    await expect(queue.present(input)).rejects.toBeInstanceOf(OwnerDigestHumanWaitUnauthorizedError);
+    await expect(queue.enqueue({ companyId, originIssueId, inboxUserId, answerScope, producerPrincipalId }))
+      .rejects.toBeInstanceOf(OwnerDigestHumanWaitUnauthorizedError);
+    const [saved] = await db.select().from(ownerDigestHumanWaits).where(eq(ownerDigestHumanWaits.id, row.id));
+    expect(saved).toMatchObject({ status: "presented", companyId, originIssueId, inboxUserId, answerScope });
+    expect(saved.presentedAt).not.toBeNull();
+  });
+
   it("rejects cross-company origin even when an invalid binding was seeded", async () => {
     const otherCompanyId = randomUUID();
     await db.insert(companies).values({ id: otherCompanyId, name: "Other", issuePrefix: "OTHER" });

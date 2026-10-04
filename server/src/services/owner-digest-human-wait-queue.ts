@@ -17,9 +17,11 @@ function sameScope(column: typeof ownerDigestHumanWaits.answerScope | typeof own
   return sql`${column} = ${JSON.stringify(scope)}::jsonb`;
 }
 
-export function ownerDigestHumanWaitQueueService(db: Db) {
+function queueWithinTransaction(db: Db) {
   async function authorized(input: { companyId: string; originIssueId: string; inboxUserId: string; answerScope: AnswerScope; producerPrincipalId: string }) {
-    const [origin] = await db.select({ id: issues.id }).from(issues).where(and(eq(issues.id, input.originIssueId), eq(issues.companyId, input.companyId))).limit(1);
+    // SHARE permits concurrent producers but orders origin edits and binding
+    // revocation against this operation's commit, including duplicate retries.
+    const [origin] = await db.select({ id: issues.id }).from(issues).where(and(eq(issues.id, input.originIssueId), eq(issues.companyId, input.companyId))).limit(1).for("share");
     if (!origin) throw new OwnerDigestHumanWaitUnauthorizedError();
     const [binding] = await db.select({ id: ownerDigestHumanWaitAuthorizations.id }).from(ownerDigestHumanWaitAuthorizations).where(and(
       eq(ownerDigestHumanWaitAuthorizations.companyId, input.companyId),
@@ -27,7 +29,7 @@ export function ownerDigestHumanWaitQueueService(db: Db) {
       eq(ownerDigestHumanWaitAuthorizations.inboxUserId, input.inboxUserId),
       eq(ownerDigestHumanWaitAuthorizations.producerPrincipalId, input.producerPrincipalId),
       sameScope(ownerDigestHumanWaitAuthorizations.answerScope, input.answerScope),
-    )).limit(1);
+    )).limit(1).for("share");
     if (!binding) throw new OwnerDigestHumanWaitUnauthorizedError();
   }
 
@@ -79,5 +81,23 @@ export function ownerDigestHumanWaitQueueService(db: Db) {
     present: (input: { id: string; companyId: string; producerPrincipalId: string }) => transition(input, "presented"),
     answer: (input: { id: string; companyId: string; producerPrincipalId: string }) => transition(input, "answered"),
     cancel: (input: { id: string; companyId: string; producerPrincipalId: string }) => transition(input, "cancelled"),
+  };
+}
+
+/** Internal persistence only. A ledger binding is not an authenticated grant. */
+export function ownerDigestHumanWaitQueueService(db: Db) {
+  type Queue = ReturnType<typeof queueWithinTransaction>;
+  function atomic<T>(operation: (queue: Queue) => Promise<T>) {
+    return db.transaction(async (tx) => {
+      // Drizzle transaction exposes the same query interface and nested
+      // transactions use savepoints; locks survive until the outer commit.
+      return operation(queueWithinTransaction(tx as unknown as Db));
+    });
+  }
+  return {
+    enqueue: (input: Parameters<Queue["enqueue"]>[0]) => atomic((queue) => queue.enqueue(input)),
+    present: (input: Parameters<Queue["present"]>[0]) => atomic((queue) => queue.present(input)),
+    answer: (input: Parameters<Queue["answer"]>[0]) => atomic((queue) => queue.answer(input)),
+    cancel: (input: Parameters<Queue["cancel"]>[0]) => atomic((queue) => queue.cancel(input)),
   };
 }
