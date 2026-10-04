@@ -85,6 +85,39 @@ describe("owner digest human-wait queue", () => {
     expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, askIssueId))).toEqual(before);
   });
 
+  it("captures bind routing before authorization waits on an origin lock", async () => {
+    const original = await carrierFixture("bind-input-original");
+    const target = await carrierFixture("bind-input-revoked-target");
+    await db.delete(ownerDigestHumanWaitAuthorizations).where(sql`${ownerDigestHumanWaitAuthorizations.answerScope} = ${JSON.stringify(target.row.answerScope)}::jsonb`);
+    const input = { ...original.input };
+    let release!: () => void, ready!: (pid: number) => void, failed!: (error: unknown) => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const held = new Promise<number>((resolve, reject) => { ready = resolve; failed = reject; });
+    const holder = db.transaction(async (tx) => {
+      await tx.update(issues).set({ title: "Held origin" }).where(eq(issues.id, originIssueId));
+      const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      ready(Number(backend.pid)); await barrier;
+    });
+    void holder.catch(failed);
+    let contender: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      const pid = await held;
+      contender = Promise.allSettled([original.queue.bindAsk(input)]);
+      await vi.waitFor(async () => {
+        expect(await db.execute(sql`select 1 from pg_stat_activity where ${pid} = any(pg_blocking_pids(pid))
+          and wait_event_type = 'Lock' and query like '%from "issues"%for share%'`)).toHaveLength(1);
+      }, { timeout: 3_000, interval: 10 });
+      input.id = target.row.id;
+      input.askIssueId = target.askIssueId;
+    } finally {
+      release(); await Promise.allSettled([holder, ...(contender ? [contender] : [])]);
+    }
+    await holder;
+    expect((await contender!)[0]).toMatchObject({ status: "fulfilled", value: { id: original.row.id, askIssueId: original.askIssueId } });
+    expect((await db.select().from(ownerDigestHumanWaits).where(eq(ownerDigestHumanWaits.id, target.row.id)))[0].askIssueId).toBeNull();
+    expect((await db.select().from(issues).where(eq(issues.id, originIssueId)))[0].status).toBe("blocked");
+  });
+
   it("never rebinds an ASK carrier, even through a direct database edit", async () => {
     const { queue, row, input } = await carrierFixture("immutable-carrier");
     await queue.bindAsk(input);

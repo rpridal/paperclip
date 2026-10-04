@@ -182,7 +182,13 @@ export function ownerDigestHumanWaitQueueService(db: Db) {
     });
   }
   return {
-    bindAsk: (input: Parameters<Queue["bindAsk"]>[0]) => atomic((queue) => queue.bindAsk(input)),
+    bindAsk: (input: Parameters<Queue["bindAsk"]>[0]) => {
+      // Capture the exact routing identity before authorization can block.
+      // A mutable caller must not retarget the write after ledger validation.
+      const captured = { id: input.id, companyId: input.companyId,
+        producerPrincipalId: input.producerPrincipalId, askIssueId: input.askIssueId };
+      return atomic((queue) => queue.bindAsk(captured));
+    },
     enqueue: async (input: Parameters<Queue["enqueue"]>[0]) => {
       const captured = { ...input, answerScope: captureAnswerScope(input.answerScope) };
       return atomic((queue) => queue.enqueue(captured));
