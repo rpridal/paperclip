@@ -33,6 +33,34 @@ const projection = { id: issues.id, identifier: issues.identifier, title: issues
   description: issues.description, status: issues.status, createdAt: issues.createdAt,
   assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId };
 export function intakeGuardStore(db: Db): IntakeGuardStore {
+  type Tx = Parameters<Parameters<Db['transaction']>[0]>[0];
+  const assertCurrent = (identity: IntakeGuardIdentity) => {
+    const current = identitySchema.safeParse(JSON.parse(process.env.PAPERCLIP_INTAKE_GUARD_IDENTITY ?? 'null'));
+    const now = Date.now();
+    if (!current.success || Object.keys(identity).some(key =>
+      identity[key as keyof IntakeGuardIdentity] !== current.data[key as keyof IntakeGuardIdentity])
+      || now < Date.parse(identity.issuedAt) || now >= Date.parse(identity.expiresAt)
+      || Date.parse(identity.expiresAt) - Date.parse(identity.issuedAt) > 30 * 86400000) {
+      throw new Error('service authority changed');
+    }
+  };
+  const operation = <T>(identity: IntakeGuardIdentity,
+    work: (tx: Tx, company: typeof companies.$inferSelect) => Promise<T>) => db.transaction(async tx => {
+    // Shared by all replicas; order company -> issuer avoids a check-before-lock race.
+    const [company] = await tx.select().from(companies).where(eq(companies.id, identity.companyId)).for('update');
+    if (!company || company.status !== 'active') throw new Error('company unavailable');
+    const [member] = await tx.select().from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, identity.companyId), eq(companyMemberships.principalType, 'user'),
+      eq(companyMemberships.principalId, identity.issuerUserId), eq(companyMemberships.status, 'active'),
+      inArray(companyMemberships.membershipRole, ['owner', 'admin', 'operator', 'member']))).for('share');
+    if (!member) throw new Error('issuer unavailable');
+    assertCurrent(identity);
+    const result = await work(tx, company);
+    assertCurrent(identity);
+    // Membership/company locks are held through COMMIT. Config cutovers still require
+    // admission-stop + all-process/DB drain; an env update is NOT an atomic DB fence.
+    return result;
+  });
   return {
     authorize: async identity => {
       const [member] = await db.select({ id: companyMemberships.id }).from(companyMemberships)
@@ -42,8 +70,8 @@ export function intakeGuardStore(db: Db): IntakeGuardStore {
           eq(companyMemberships.status, 'active'), inArray(companyMemberships.membershipRole, ['owner', 'admin', 'operator', 'member'])));
       return !!member;
     },
-    list: async identity => db.select(projection).from(issues).where(owned(identity)),
-    read: async (identity, id) => db.transaction(async tx => {
+    list: async identity => operation(identity, async tx => tx.select(projection).from(issues).where(owned(identity))),
+    read: async (identity, id) => operation(identity, async tx => {
       const [row] = await tx.select(projection).from(issues).where(and(owned(identity), eq(issues.id, id)));
       if (!row) return null;
       await tx.insert(activityLog).values({ companyId: identity.companyId, actorType: 'service', actorId: identity.id,
@@ -51,10 +79,7 @@ export function intakeGuardStore(db: Db): IntakeGuardStore {
         details: { credentialVersion: identity.credentialVersion } });
       return row;
     }),
-    create: async (identity, finding) => db.transaction(async tx => {
-      // Company-row lock serializes all credentials, replicas and closed episodes.
-      const [company] = await tx.select().from(companies).where(eq(companies.id, identity.companyId)).for('update');
-      if (!company || company.status !== 'active') throw new Error('company unavailable');
+    create: async (identity, finding) => operation(identity, async (tx, company) => {
       const rows = await tx.select().from(issues).where(owned(identity)).orderBy(desc(issues.createdAt));
       const project = (row: typeof issues.$inferSelect) => ({ id: row.id, identifier: row.identifier,
         title: row.title, description: row.description, status: row.status, createdAt: row.createdAt,
