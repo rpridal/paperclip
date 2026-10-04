@@ -193,8 +193,17 @@ export function ownerDigestHumanWaitQueueService(db: Db) {
       const captured = { ...input, answerScope: captureAnswerScope(input.answerScope) };
       return atomic((queue) => queue.enqueue(captured));
     },
-    present: (input: Parameters<Queue["present"]>[0]) => atomic((queue) => queue.present(input)),
-    answer: (input: Parameters<Queue["answer"]>[0]) => atomic((queue) => queue.answer(input)),
-    cancel: (input: Parameters<Queue["cancel"]>[0]) => atomic((queue) => queue.cancel(input)),
+    present: (input: Parameters<Queue["present"]>[0]) => {
+      const captured = { id: input.id, companyId: input.companyId, producerPrincipalId: input.producerPrincipalId };
+      return atomic((queue) => queue.present(captured));
+    },
+    answer: (input: Parameters<Queue["answer"]>[0]) => {
+      const captured = { id: input.id, companyId: input.companyId, producerPrincipalId: input.producerPrincipalId };
+      return atomic((queue) => queue.answer(captured));
+    },
+    cancel: (input: Parameters<Queue["cancel"]>[0]) => {
+      const captured = { id: input.id, companyId: input.companyId, producerPrincipalId: input.producerPrincipalId };
+      return atomic((queue) => queue.cancel(captured));
+    },
   };
 }

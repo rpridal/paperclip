@@ -118,6 +118,25 @@ describe("owner digest human-wait queue", () => {
     expect((await db.select().from(issues).where(eq(issues.id, originIssueId)))[0].status).toBe("blocked");
   });
 
+  it.each(["present", "answer", "cancel"] as const)("captures %s routing before the transaction starts", async (method) => {
+    const original = await carrierFixture(`lifecycle-input-original-${method}`);
+    const target = await carrierFixture(`lifecycle-input-target-${method}`);
+    if (method === "answer") {
+      await original.queue.present(original.input);
+      await target.queue.present(target.input);
+    }
+    const input = { id: original.row.id, companyId, producerPrincipalId };
+    const pending = original.queue[method](input);
+    // The transaction starts asynchronously; no sleep or scheduling winner
+    // assumption is needed to mutate caller-owned scalars after invocation.
+    input.id = target.row.id;
+    const status = method === "present" ? "presented" : method === "answer" ? "answered" : "cancelled";
+    expect(await pending).toMatchObject({ id: original.row.id, status, duplicate: false });
+    expect((await db.select().from(ownerDigestHumanWaits).where(eq(ownerDigestHumanWaits.id, target.row.id)))[0].status)
+      .toBe(method === "answer" ? "presented" : "queued");
+    expect((await db.select().from(issues).where(eq(issues.id, originIssueId)))[0].status).toBe("blocked");
+  });
+
   it("never rebinds an ASK carrier, even through a direct database edit", async () => {
     const { queue, row, input } = await carrierFixture("immutable-carrier");
     await queue.bindAsk(input);
