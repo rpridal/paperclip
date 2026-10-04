@@ -788,6 +788,9 @@ export function documentService(db: Db) {
           .from(issueDocuments)
           .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
           .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, key)))
+          // Match upsert and source readers: document before attachments.
+          // OF avoids planner-selected attachment-first joined row locks.
+          .for("update", { of: documents })
           .then((rows) => rows[0] ?? null);
 
         if (!existing) return null;

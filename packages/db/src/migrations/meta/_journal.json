@@ -1989,6 +1989,20 @@
       "when": 1790830068222,
       "tag": "0285_colorful_starjammers",
       "breakpoints": true
+    },
+    {
+      "idx": 286,
+      "version": "7",
+      "when": 1791091818395,
+      "tag": "0286_naive_steve_rogers",
+      "breakpoints": true
+    },
+    {
+      "idx": 287,
+      "version": "7",
+      "when": 1791095408952,
+      "tag": "0287_powerful_bloodscream",
+      "breakpoints": true
     }
   ]
 }
