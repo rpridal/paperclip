@@ -1,0 +1,149 @@
+name: Offline intake validation
+
+# Fork-only controller. The source checkout stays at the reviewed SHA.
+on:
+  push:
+    branches: [ci/offline-intake-validation]
+    paths: [.github/workflows/offline-intake-validation.yml]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offline-intake-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  canonical:
+    if: github.repository == 'rpridal/paperclip'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        gate: [typecheck, test, build]
+    env:
+      SOURCE_SHA: e062119baf1232d305129cf3b6b3dadfaa8da2d3
+      PAPERCLIP_TELEMETRY_ENABLED: 'false'
+    steps:
+      - name: Checkout exact validation source (not controller head)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: e062119baf1232d305129cf3b6b3dadfaa8da2d3
+          persist-credentials: false
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86
+        with:
+          version: 9.15.4
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.21.0
+      - name: Source, toolchain and disposable identity preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(id -u)" != 0
+          mkdir -p "$RUNNER_TEMP/offline-evidence" "$RUNNER_TEMP/offline-home"
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt
+          {
+            git rev-parse HEAD
+            git rev-parse HEAD^{tree}
+            node --version
+            pnpm --version
+            rustc +1.97.1 --version
+            cargo +1.97.1 --version
+            id -u
+          } > "$RUNNER_TEMP/offline-evidence/preflight.txt"
+      - name: Locked dependencies with real lifecycle scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/offline-home" TMPDIR="$RUNNER_TEMP" \
+            PAPERCLIP_TELEMETRY_ENABLED=false pnpm install --frozen-lockfile
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/offline-home" CARGO_HOME="$HOME/.cargo" \
+            RUSTUP_HOME="$HOME/.rustup" RUSTUP_TOOLCHAIN=1.97.1 \
+            cargo fetch --locked --manifest-path packages/paperclip-runner/runner/Cargo.toml
+      - name: Build genuine test-checkout prerequisite
+        if: matrix.gate == 'test'
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          start=$(date +%s)
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/offline-home" TMPDIR="$RUNNER_TEMP" \
+            PAPERCLIP_TELEMETRY_ENABLED=false timeout --signal=TERM --kill-after=10s 5m \
+            pnpm --filter @paperclipai/plugin-sdk run build 2>&1 | tee "$RUNNER_TEMP/offline-evidence/prerequisite.log"
+          rc=${PIPESTATUS[0]}
+          printf '{"source":"%s","rc":%s,"elapsedSeconds":%s}\n' \
+            "$SOURCE_SHA" "$rc" "$(( $(date +%s) - start ))" > "$RUNNER_TEMP/offline-evidence/prerequisite.json"
+          exit "$rc"
+      - name: Root-cwd corrected process and startup probes
+        if: matrix.gate == 'test'
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          start=$(date +%s)
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/offline-home" TMPDIR="$RUNNER_TEMP" \
+            PAPERCLIP_TELEMETRY_ENABLED=false NO_COLOR=1 FORCE_COLOR=0 \
+            timeout --signal=TERM --kill-after=10s 2m pnpm exec vitest run \
+            server/src/__tests__/intake-guard-process.test.ts \
+            server/src/__tests__/server-startup-feedback-export.test.ts \
+            2>&1 | tee "$RUNNER_TEMP/offline-evidence/root-cwd.log"
+          rc=${PIPESTATUS[0]}
+          printf '{"source":"%s","rc":%s,"elapsedSeconds":%s}\n' \
+            "$SOURCE_SHA" "$rc" "$(( $(date +%s) - start ))" > "$RUNNER_TEMP/offline-evidence/root-cwd.json"
+          # Diagnostic probe never substitutes for, or prevents, the full gate.
+          exit 0
+      - name: Canonical full gate in credential-free environment
+        shell: bash
+        env:
+          GATE: ${{ matrix.gate }}
+        run: |
+          set -uo pipefail
+          set +e
+          case "$GATE" in
+            typecheck) command=(pnpm -r typecheck);;
+            test) command=(pnpm test:run);;
+            build) command=(pnpm build);;
+            *) exit 2;;
+          esac
+          evidence="$RUNNER_TEMP/offline-evidence"
+          start=$(date +%s)
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/offline-home" TMPDIR="$RUNNER_TEMP" \
+            CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" RUSTUP_TOOLCHAIN=1.97.1 \
+            CARGO_NET_OFFLINE=true PAPERCLIP_TELEMETRY_ENABLED=false NO_COLOR=1 FORCE_COLOR=0 \
+            timeout --signal=TERM --kill-after=10s 40m "${command[@]}" 2>&1 | tee "$evidence/gate.log"
+          rc=${PIPESTATUS[0]}
+          elapsed=$(( $(date +%s) - start ))
+          printf '{"source":"%s","gate":"%s","rc":%s,"elapsedSeconds":%s}\n' \
+            "$SOURCE_SHA" "$GATE" "$rc" "$elapsed" > "$evidence/result.json"
+          if [ "$rc" -ne 0 ]; then
+            printf 'FAIL: canonical command rc=%s; later phases may be unexecuted; no full/no-skip PASS.\n' "$rc" > "$evidence/gate-verdict.txt"
+            exit "$rc"
+          fi
+          if [ "$GATE" = test ]; then
+            # A successful process with declared skips is not a no-skip gate.
+            if grep -Eq '[1-9][0-9]* (skipped|todo)' "$evidence/gate.log"; then
+              printf 'FAIL: declared skipped/todo tests; inspect raw log.\n' > "$evidence/no-skip-verdict.txt"
+              exit 1
+            fi
+            if ! grep -Eq 'Tests[[:space:]]+[1-9][0-9]* passed' "$evidence/gate.log"; then
+              printf 'FAIL: no executed test summary.\n' > "$evidence/no-skip-verdict.txt"
+              exit 1
+            fi
+            printf 'No skipped/todo tests observed in canonical full-run summaries.\n' > "$evidence/no-skip-verdict.txt"
+          fi
+      - name: Preserve exact-head raw evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: offline-${{ matrix.gate }}-e062119
+          path: ${{ runner.temp }}/offline-evidence/
+          if-no-files-found: error
+          retention-days: 14
