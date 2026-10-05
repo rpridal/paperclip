@@ -4,11 +4,12 @@ import { describe, it, expect } from 'vitest';
 import type { AdapterExecutionContext, AdapterLegacyToolApproval } from '@paperclipai/adapter-utils';
 import { execute } from '../../../packages/adapters/hermes/src/gateway/server/execute.js';
 
-async function fixture(mode: 'headers' | 'body', wrongTerminalRun = false, creation: 'normal' | 'pre-cancelled' | 'body' = 'normal', stopMode: 'normal' | 'headers' | 'body' = 'normal', review: { missingFinalId?: boolean; skipPending?: boolean; pollApproval?: boolean; terminalSse?: boolean; onLog?: AdapterExecutionContext['onLog']; onApproval?: () => void } = {}) {
+async function fixture(mode: 'headers' | 'body', wrongTerminalRun = false, creation: 'normal' | 'pre-cancelled' | 'body' = 'normal', stopMode: 'normal' | 'headers' | 'body' = 'normal', review: { missingFinalId?: boolean; skipPending?: boolean; pollApproval?: boolean; terminalSse?: boolean; completedGetAfterLog?: boolean; onLog?: AdapterExecutionContext['onLog']; onApproval?: () => void } = {}) {
   let pending: AdapterLegacyToolApproval | undefined;
   let posts = 0;
   let stops = 0;
   let completed = false;
+  let terminalLogEntered = false;
   let creations = 0;
   const controller = new AbortController();
   const runId = 'abort-provider';
@@ -34,7 +35,7 @@ async function fixture(mode: 'headers' | 'body', wrongTerminalRun = false, creat
       stops++; completed = true;
       if (stopMode === 'normal') res.end(JSON.stringify({ run_id: wrongTerminalRun ? 'other-provider' : runId, status: 'cancelled' }));
       else if (stopMode === 'body') { res.writeHead(200); res.write('{"run_id":'); }
-    } else res.end(JSON.stringify({ run_id: completed && review.missingFinalId ? undefined : completed && wrongTerminalRun ? 'other-provider' : runId, status: completed && !review.terminalSse ? 'completed' : 'waiting_for_approval', ...(review.pollApproval ? { approval: { event: 'approval.request', run_id: runId, request_id: requestId } } : {}) }));
+    } else res.end(JSON.stringify({ run_id: completed && review.missingFinalId ? undefined : completed && wrongTerminalRun ? 'other-provider' : runId, status: completed && (!review.terminalSse || (review.completedGetAfterLog && terminalLogEntered)) ? 'completed' : 'waiting_for_approval', ...(review.pollApproval ? { approval: { event: 'approval.request', run_id: runId, request_id: requestId } } : {}) }));
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const addr = server.address(); if (!addr || typeof addr === 'string') throw new Error('port');
@@ -43,7 +44,10 @@ async function fixture(mode: 'headers' | 'body', wrongTerminalRun = false, creat
     signal: controller.signal,
     runId: 'abort-paperclip', agent: { id: 'fixture', companyId: 'fixture', name: 'fixture', adapterType: 'hermes_gateway', adapterConfig: config },
     config, context: {}, runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-    onLog: review.onLog ?? (async () => {}), onLegacyToolApproval: async value => { pending = value; review.onApproval?.(); },
+    onLog: async (stream, text) => {
+      if (text.includes('event=run.completed')) terminalLogEntered = true;
+      await review.onLog?.(stream, text);
+    }, onLegacyToolApproval: async value => { pending = value; review.onApproval?.(); },
   };
   if (creation === 'pre-cancelled') controller.abort();
   const execution = execute(ctx);
@@ -105,12 +109,12 @@ describe('bounded exact resolver HTTP I/O', () => {
       expect(disposable.posts()).toBe(0);
     } finally { await disposable.close(); }
   });
-  it('review: terminal SSE fences an old resolver before deferred terminal logging completes', async () => {
+  it.each([false, true])('review: terminal SSE fences an old resolver and settles before deferred logging (completed GET=%s)', async completedGetAfterLog => {
     let release!: () => void;
     let entered = false;
     const gate = new Promise<void>(resolve => { release = resolve; });
     const disposable = await fixture('headers', false, 'normal', 'normal', {
-      terminalSse: true,
+      terminalSse: true, completedGetAfterLog,
       onLog: async (_stream, text) => {
         if (text.includes('event=run.completed')) { entered = true; await gate; }
       },
@@ -120,8 +124,11 @@ describe('bounded exact resolver HTTP I/O', () => {
       await expect.poll(() => entered, { timeout: 1000 }).toBe(true);
       expect(await observe(disposable.pending.resolve('once'), 100)).toBe('rejected');
       expect(disposable.posts()).toBe(0);
-      release();
+      // Terminal proof must settle execution before the log callback is released.
+      expect(await observe(disposable.execution, 1000)).toBe('accepted');
       expect((await disposable.execution).exitCode).toBe(0);
+      expect(disposable.stops()).toBe(0);
+      release();
     } finally { release(); await disposable.close(); }
   });
   it('review: missing run id in final status is not exact termination proof', async () => {

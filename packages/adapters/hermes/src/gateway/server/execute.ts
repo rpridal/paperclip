@@ -539,8 +539,17 @@ async function handleEvent(
   const status = extractStatus(parsed) ?? (eventName?.startsWith("run.") ? eventName.slice(4) : null);
   const isTerminal = Boolean(status && TERMINAL_STATUSES.has(status));
   if (state.lifecycleClosed || ctx.signal?.aborted) return;
-  // Observe terminal consent closure before any asynchronous log callback.
-  if (isTerminal) state.lifecycleClosed = true;
+  // Terminal proof settles independently of logging/publication. markTerminal
+  // also closes consent synchronously, fencing callbacks and old resolvers.
+  if (isTerminal && status) {
+    markTerminal(state, {
+      runId: state.runId,
+      status,
+      eventName,
+      payload: record,
+      output: extractOutput(parsed),
+    });
+  }
   state.lastEventName = eventName;
   await ctx.onLog(
     "stdout",
@@ -566,16 +575,6 @@ async function handleEvent(
     const sanitizedDelta = redactText(delta);
     state.outputChunks.push(sanitizedDelta);
     await ctx.onLog("stdout", sanitizedDelta);
-  }
-
-  if (status && TERMINAL_STATUSES.has(status)) {
-    markTerminal(state, {
-      runId: state.runId,
-      status,
-      eventName,
-      payload: record,
-      output: extractOutput(parsed),
-    });
   }
 }
 
@@ -615,7 +614,8 @@ async function pollStatus(input: {
       });
       const normalized = extractStatus(status);
       const record = asRecord(status);
-      if (input.signal.aborted || input.state.lifecycleClosed) return;
+      // Consent closure must not disable the independent terminal fallback.
+      if (input.signal.aborted) return;
       if (normalized && TERMINAL_STATUSES.has(normalized)) {
         markTerminal(input.state, {
           runId: input.state.runId,
