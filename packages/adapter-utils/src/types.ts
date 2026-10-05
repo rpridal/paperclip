@@ -194,6 +194,16 @@ export interface AdapterRuntimeEvent {
   payload?: Record<string, unknown>;
 }
 
+/** A one-shot consent request from a legacy, non-native adapter transport. */
+export interface AdapterLegacyToolApproval {
+  provider: "hermes_gateway";
+  providerRunId: string;
+  requestId: string;
+  choices: readonly ["once", "deny"];
+  /** Sends the exact provider request; credentials remain adapter-private. */
+  resolve: (choice: "once" | "deny") => Promise<void>;
+}
+
 export interface AdapterExecutionContext {
   /** Run-scoped operator cancellation; adapters must settle before returning. */
   signal?: AbortSignal;
@@ -223,6 +233,8 @@ export interface AdapterExecutionContext {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
+  /** Host-owned resolver registration for a one-shot legacy tool consent. */
+  onLegacyToolApproval?: (approval: AdapterLegacyToolApproval) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
   /**
    * Reports that execution has crossed the adapter's dispatch boundary.

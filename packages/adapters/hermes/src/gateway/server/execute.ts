@@ -52,6 +52,8 @@ type ExecutionState = {
   runId: string;
   outputChunks: string[];
   lastEventName: string | null;
+  /** Never re-register a consent after an SSE reconnect or status poll. */
+  reportedApprovalRequestIds: Set<string>;
   terminal: TerminalState | null;
   resolveTerminal: (state: TerminalState) => void;
   terminalPromise: Promise<TerminalState>;
@@ -442,6 +444,7 @@ function createExecutionState(runId: string): ExecutionState {
     runId,
     outputChunks: [],
     lastEventName: null,
+    reportedApprovalRequestIds: new Set(),
     terminal: null,
     resolveTerminal,
     terminalPromise,
@@ -473,11 +476,46 @@ function extractOutput(value: unknown): string | null {
   return nested ? extractOutput(nested) : null;
 }
 
+function approvalRequestId(eventName: string | null, value: Record<string, unknown> | null, providerRunId: string): string | null {
+  const approval = eventName === "approval.request" ? value : asRecord(value?.approval);
+  if (!approval) return null;
+  // An explicit mismatch in either polling envelope or SSE payload rejects
+  // the request. Missing nested run ID is compatible only with an exact outer ID.
+  const runIds = [value?.run_id, value?.runId, approval.run_id, approval.runId]
+    .filter((id) => id !== undefined && id !== null);
+  if (runIds.length === 0 || runIds.some((id) => id !== providerRunId)) return null;
+  const nestedEvent = nonEmpty(approval.event) ?? nonEmpty(approval.type);
+  if (eventName !== "approval.request" && nestedEvent !== "approval.request") return null;
+  const requestId = nonEmpty(approval.request_id) ?? nonEmpty(approval.requestId);
+  return requestId && requestId.length <= 256 ? requestId : null;
+}
+
+async function reportLegacyApproval(
+  ctx: AdapterExecutionContext,
+  state: ExecutionState,
+  eventName: string | null,
+  record: Record<string, unknown> | null,
+  resolve: (requestId: string, choice: "once" | "deny") => Promise<void>,
+): Promise<void> {
+  const requestId = approvalRequestId(eventName, record, state.runId);
+  if (!requestId || state.reportedApprovalRequestIds.has(requestId)) return;
+  state.reportedApprovalRequestIds.add(requestId);
+  if (!ctx.onLegacyToolApproval) return;
+  await ctx.onLegacyToolApproval({
+    provider: "hermes_gateway",
+    providerRunId: state.runId,
+    requestId,
+    choices: ["once", "deny"],
+    resolve: (choice: "once" | "deny") => resolve(requestId, choice),
+  });
+}
+
 async function handleEvent(
   ctx: AdapterExecutionContext,
   state: ExecutionState,
   frame: SseFrame,
   redactText: TextRedactor = sanitizeSensitiveText,
+  resolveLegacyApproval?: (requestId: string, choice: "once" | "deny") => Promise<void>,
 ): Promise<void> {
   const parsed = parseJsonData(frame.data);
   const record = asRecord(parsed);
@@ -487,6 +525,19 @@ async function handleEvent(
     "stdout",
     `[hermes-gateway:event] run=${state.runId} event=${eventName ?? "message"} data=${stringifyForLog(redactForLog(parsed, [], 0, redactText), 8_000)}\n`,
   );
+  if (resolveLegacyApproval) {
+    await reportLegacyApproval(ctx, state, eventName, record, resolveLegacyApproval);
+  }
+  if (eventName && eventName !== "approval.request") {
+    await ctx.onEvent?.({
+      eventType: `hermes_gateway.${eventName}`,
+      stream: "system",
+      level: "info",
+      // Event persistence/live publication must use the same exact-secret
+      // boundary as stdout, not only the server's generic pattern redactor.
+      payload: redactForLog(record ?? { text: frame.data }, [], 0, redactText) as Record<string, unknown>,
+    });
+  }
 
   const delta = nonEmpty(record?.delta) ?? nonEmpty(record?.text_delta);
   if (eventName === "message.delta" && delta) {
@@ -530,6 +581,7 @@ async function pollStatus(input: {
   signal: AbortSignal;
   intervalMs: number;
   redactText?: TextRedactor;
+  resolveLegacyApproval?: (requestId: string, choice: "once" | "deny") => Promise<void>;
 }): Promise<void> {
   while (!input.signal.aborted && !input.state.terminal) {
     await delay(input.intervalMs, input.signal);
@@ -541,6 +593,14 @@ async function pollStatus(input: {
         signal: input.signal,
       });
       const normalized = extractStatus(status);
+      const record = asRecord(status);
+      await reportLegacyApproval(
+        input.ctx,
+        input.state,
+        nonEmpty(record?.last_event) ?? null,
+        record,
+        input.resolveLegacyApproval ?? (async () => undefined),
+      );
       if (normalized && TERMINAL_STATUSES.has(normalized)) {
         markTerminal(input.state, {
           runId: input.state.runId,
@@ -564,6 +624,7 @@ async function consumeEvents(input: {
   signal: AbortSignal;
   reconnectMs: number;
   redactText?: TextRedactor;
+  resolveLegacyApproval?: (requestId: string, choice: "once" | "deny") => Promise<void>;
 }): Promise<void> {
   while (!input.signal.aborted && !input.state.terminal) {
     try {
@@ -592,7 +653,7 @@ async function consumeEvents(input: {
             const parsed = parseSseFramesForTest(`${buffer}\n\n`);
             buffer = parsed.rest;
             for (const frame of parsed.frames) {
-              await handleEvent(input.ctx, input.state, frame, input.redactText);
+              await handleEvent(input.ctx, input.state, frame, input.redactText, input.resolveLegacyApproval);
               if (input.state.terminal) break;
             }
           }
@@ -602,7 +663,7 @@ async function consumeEvents(input: {
         const parsed = parseSseFramesForTest(buffer);
         buffer = parsed.rest;
         for (const frame of parsed.frames) {
-          await handleEvent(input.ctx, input.state, frame, input.redactText);
+          await handleEvent(input.ctx, input.state, frame, input.redactText, input.resolveLegacyApproval);
           if (input.state.terminal) break;
         }
       }
@@ -855,6 +916,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     sessionKey,
     runHeaders.Authorization,
     runHeaders["X-Hermes-Session-Key"],
+    ...Object.values(extraHeaders),
   ]);
   const body = buildRunBody(ctx, sessionKey);
   const createRunUrl = apiUrl(baseUrl, "/v1/runs");
@@ -902,6 +964,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   await ctx.onLog("stdout", `[hermes-gateway] run created: ${runId}\n`);
 
+  const approvalHeaders = buildHeaders({
+    apiKey,
+    sessionKey,
+    runId: ctx.runId,
+    extraHeaders,
+    accept: "application/json",
+    contentType: "application/json",
+  });
+  const resolveLegacyApproval = async (requestId: string, choice: "once" | "deny") => {
+    const ack = asRecord(await fetchJson(apiUrl(baseUrl, `/v1/runs/${encodeURIComponent(runId)}/approval`), {
+      method: "POST",
+      headers: approvalHeaders,
+      // Hermes requires the exact provider request id; do not use session or a synthetic turn id.
+      body: JSON.stringify({ request_id: requestId, choice }),
+    }));
+    if (ack?.run_id !== runId || ack.request_id !== requestId || ack.choice !== choice || ack.resolved !== 1) {
+      // Delivery may already have happened. Report unknown, never retry this POST.
+      throw new Error("Hermes approval acknowledgement did not match the exact request.");
+    }
+  };
   const state = createExecutionState(runId);
   const controller = new AbortController();
   void consumeEvents({
@@ -912,6 +994,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     signal: controller.signal,
     reconnectMs,
     redactText,
+    resolveLegacyApproval,
   }).catch(() => undefined);
   void pollStatus({
     ctx,
@@ -921,6 +1004,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     signal: controller.signal,
     intervalMs: pollIntervalMs,
     redactText,
+    resolveLegacyApproval,
   }).catch(() => undefined);
 
   let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
