@@ -56,6 +56,14 @@ The createApp suite now uses createBetterAuthInstance, its real handler and reso
 
 Broader local checks: workspace-link preflight and module-boundary check pass; server build reaches runner binary compilation and fails because cargo is unavailable. That is not a full build PASS. Repository-wide test/typecheck and production sampler integration remain separate gates; independent review must evaluate the new exact head.
 
+## Root-cwd delivery corrections (OFFLINE only)
+
+The credential-free Linux validation lane ran the exact reviewed source `1601d89e02aa42e3350a23442fba19e3fe3f02b5`: full build and recursive typecheck passed, but root test:run failed in its first general-server phase. Later phases were not executed and skips are not PASS. This supersedes the historical cargo-unavailable limitation; it is not a full delivery PASS.
+
+Two narrow failures reproduced locally: the startup scheduling suite's complete DB mock omitted issue schema exports newly imported by auth, and the restart fixture passed a bare `tsx` import to a child launched from the root, which has no root tsx dependency. The scheduling suite now preserves real exports through a partial mock while retaining its explicit startup stubs. The child resolves the genuine server-owned tsx loader to an absolute module URL; its credential allowlist and IPC boundaries are unchanged. Root-cwd execution of both suites returned 21 passed / 2 files, zero skips, after their respective pre-fix collection/process failures. No production auth/store behavior is changed by these test corrections.
+
+Remaining delivery gates: rerun the supported Linux lane with genuine plugin-sdk build prerequisites in the test checkout (another job's dist is not shared), preserve failure verdicts despite bash errexit, classify remaining failures with runtime base/head controls, and obtain a new independent SHA-pinned verdict on the changed test head. The earlier security PASS applies only to the earlier SHA. No credential issuance, installation, merge, production drain or release is authorized.
+
 ## Evidence and remaining gates
 
 Live GET `/api/health` identified source commit `3549b7821728c2fdbe8fafa2ca10ba3ebc8b3061`, version `2026.930.0+fork.cre804`. The branch is based on that exact commit. The shipped runtime has not been changed.

@@ -25,7 +25,8 @@ describe('intake guard process restart — OFFLINE', () => {
     credentialVersion: 'offline-process-v1' };
   async function launch(input: object) {
     const child = fork(fileURLToPath(new URL('./helpers/intake-guard-process.ts', import.meta.url)), [], {
-      execArgv: ['--import', 'tsx'],
+      // Resolve from this server package, not the invoking root/workspace cwd.
+      execArgv: ['--import', import.meta.resolve('tsx')],
       // Do not inherit any Paperclip/Forgejo/board credentials from this heartbeat.
       env: { PATH: process.env.PATH, HOME: root, TMPDIR: root, NODE_ENV: 'test', LOG_LEVEL: 'silent' },
       stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
