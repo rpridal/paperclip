@@ -109,6 +109,11 @@ import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import {
+  getLegacyToolApproval,
+  resolveLegacyToolApproval,
+  clearLegacyToolApprovalsForRun,
+} from "../services/legacy-tool-approval-registry.js";
+import {
   persistReprojectedWorkspaceDiffs,
   projectCodexWorkspaceDiffsFromTrace,
   type WorkspaceDiffReprojectionSkipReason,
@@ -6811,6 +6816,8 @@ export function agentRoutes(
     // Stamp the cancellation as operator-initiated (this route is board-only).
     // Recovery reads this to stand down instead of classifying the cancelled
     // run as agent stranding and re-waking the agent the operator just stopped.
+    // Synchronous consent fence before cancellation yields to provider/DB I/O.
+    clearLegacyToolApprovalsForRun(runId);
     const run = await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
       resultJson: {
         cancelledByActorType: "user",
@@ -6819,6 +6826,7 @@ export function agentRoutes(
     });
 
     if (run) {
+      clearLegacyToolApprovalsForRun(run.id);
       await logActivity(db, {
         companyId: run.companyId,
         actorType: "user",
@@ -7040,6 +7048,40 @@ export function agentRoutes(
       }
     },
   );
+
+  router.post("/heartbeat-runs/:runId/legacy-tool-approvals/:requestId/resolve", async (req, res) => {
+    assertBoard(req);
+    assertInstanceAdmin(req);
+    const runId = readHeartbeatRunId(req);
+    const requestId = typeof req.params.requestId === "string" ? req.params.requestId.trim() : "";
+    const choice = typeof req.body?.choice === "string" ? req.body.choice : "";
+    if (!requestId || requestId.length > 256) throw badRequest("An exact approval request identifier is required.");
+    if (choice !== "once" && choice !== "deny") throw badRequest("Approval choice must be once or deny.");
+    const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
+    if (!existing) return;
+    if (existing.status !== "running" ||
+        parseObject(parseObject(existing.resultJson).executionCancellation).state === "requested") {
+      clearLegacyToolApprovalsForRun(runId);
+      throw conflict("This run is no longer accepting tool approval responses.");
+    }
+    const pending = getLegacyToolApproval({ runId, requestId });
+    if (!pending || pending.companyId !== existing.companyId || pending.agentId !== existing.agentId) {
+      throw conflict("This tool approval is stale or is no longer pending.");
+    }
+    // The registry consumes before provider I/O, so an ambiguous delivery cannot be replayed.
+    const resolved = await resolveLegacyToolApproval({ runId, requestId, choice });
+    if (!resolved) throw conflict("This tool approval is stale or is no longer pending.");
+    await logActivity(db, {
+      companyId: existing.companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "local-admin",
+      action: "heartbeat.legacy_tool_approval_resolved",
+      entityType: "heartbeat_run",
+      entityId: existing.id,
+      details: { requestId, provider: pending.provider, providerRunId: pending.providerRunId, choice },
+    });
+    res.status(202).json({ accepted: true, requestId, choice });
+  });
 
   router.post("/heartbeat-runs/:runId/watchdog-decisions", async (req, res) => {
     const runId = readHeartbeatRunId(req);
