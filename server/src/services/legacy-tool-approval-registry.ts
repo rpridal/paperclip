@@ -8,6 +8,10 @@ type Registration = {
 };
 
 const registrations = new Map<string, Registration>();
+// Run IDs are immutable. Keep closing tombstones for this process lifetime:
+// terminal cleanup must not reopen a delayed callback holding a running snapshot.
+// Restart drops both tombstones and resolver credentials, so it fails closed.
+const closingRuns = new Set<string>();
 
 function key(runId: string, requestId: string): string {
   return `${runId}\u0000${requestId}`;
@@ -24,6 +28,7 @@ export function registerLegacyToolApproval(input: {
   agentId: string;
   approval: AdapterLegacyToolApproval;
 }): boolean {
+  if (closingRuns.has(input.runId)) return false;
   const registrationKey = key(input.runId, input.approval.requestId);
   if (registrations.has(registrationKey)) return false;
   registrations.set(registrationKey, {
@@ -36,6 +41,7 @@ export function registerLegacyToolApproval(input: {
 }
 
 export function getLegacyToolApproval(input: { runId: string; requestId: string }) {
+  if (closingRuns.has(input.runId)) return null;
   const registration = registrations.get(key(input.runId, input.requestId));
   if (!registration || registration.consumed) return null;
   return {
@@ -53,6 +59,7 @@ export async function resolveLegacyToolApproval(input: {
   requestId: string;
   choice: "once" | "deny";
 }): Promise<boolean> {
+  if (closingRuns.has(input.runId)) return false;
   const registrationKey = key(input.runId, input.requestId);
   const registration = registrations.get(registrationKey);
   if (!registration || registration.consumed) return false;
@@ -66,6 +73,7 @@ export async function resolveLegacyToolApproval(input: {
 }
 
 export function clearLegacyToolApprovalsForRun(runId: string): void {
+  closingRuns.add(runId);
   for (const registrationKey of registrations.keys()) {
     if (registrationKey.startsWith(`${runId}\u0000`)) registrations.delete(registrationKey);
   }
