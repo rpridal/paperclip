@@ -72,6 +72,7 @@ import {
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
   checkoutIssueSchema,
+  participateIssueThreadInteractionSchema,
   createDocumentAnnotationCommentSchema,
   createDocumentAnnotationThreadSchema,
   createChildIssueSchema,
@@ -16022,6 +16023,48 @@ export function issueRoutes(
       }
 
       res.status(201).json(interaction);
+    },
+  );
+
+  router.post(
+    "/issues/:id/interactions/:interactionId/participate",
+    validate(participateIssueThreadInteractionSchema),
+    async (req, res) => {
+      const issue = await getAccessibleResource(
+        req, res, svc.getById(req.params.id as string), "Issue not found",
+      );
+      if (!issue) return;
+      if (req.actor.type !== "agent") {
+        throw forbidden("Interaction participation requires an agent");
+      }
+      const authorized = await getIssueThreadInteractionResolutionAuthorization(
+        req, res, issue, req.params.interactionId as string,
+      );
+      if (!authorized) return;
+      const actor = getActorInfo(req);
+      const participation = await authorized.interactionSvc.participate(
+        issue,
+        req.params.interactionId as string,
+        {
+          agentId: actor.agentId,
+          runId: actor.runId,
+          resolverPolicyRestriction:
+            authorized.resolutionAuthorization.resolverPolicyRestriction,
+        },
+      );
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.thread_interaction_participation_checked",
+        entityType: "issue",
+        entityId: issue.id,
+        details: { interactionId: participation.interactionId, scope: participation.scope },
+      });
+      res.json(participation);
     },
   );
 
