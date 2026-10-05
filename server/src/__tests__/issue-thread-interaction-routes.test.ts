@@ -32,6 +32,7 @@ const mockInteractionService = vi.hoisted(() => ({
   getForIssue: vi.fn(),
   create: vi.fn(),
   acceptInteraction: vi.fn(),
+  participate: vi.fn(),
   acceptSuggestedTasks: vi.fn(),
   rejectInteraction: vi.fn(),
   rejectSuggestedTasks: vi.fn(),
@@ -2749,6 +2750,96 @@ describe.sequential("issue thread interaction routes", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(mockInteractionService.acceptInteraction).toHaveBeenCalled();
+  });
+
+  it("preflights an addressed non-assignee without an issue checkout", async () => {
+    mockInteractionService.getForIssue.mockResolvedValue({
+      id: "interaction-participant", kind: "request_confirmation", status: "pending",
+      createdByAgentId: ASSIGNEE_AGENT_ID, addresseeAgentId: UNRELATED_AGENT_ID,
+      sourceRunId: RUN_1, effectiveResolverPolicy: "not_creator",
+      payload: { version: 1, prompt: "Publish the exact-head host review" },
+    });
+    mockInteractionService.participate.mockResolvedValue({
+      interactionId: "interaction-participant", runId: RUN_3,
+      scope: "interaction", allowedActions: ["accept", "reject"],
+    });
+    const app = await createApp({ type: "agent", agentId: UNRELATED_AGENT_ID, companyId: "company-1", runId: RUN_3 });
+    const response = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-participant/participate")
+      .send({});
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ interactionId: "interaction-participant", runId: RUN_3, scope: "interaction", allowedActions: ["accept", "reject"] });
+  });
+
+  it("does not let participants self-grant roles or impersonate another agent in the preflight body", async () => {
+    const app = await createApp({ type: "agent", agentId: UNRELATED_AGENT_ID, companyId: "company-1", runId: RUN_3 });
+    const response = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-participant/participate")
+      .send({ agentId: ASSIGNEE_AGENT_ID, role: "admin", status: "done" });
+    expect(response.status).toBe(400);
+  });
+
+  it("denies an unaddressed actor before participant preflight", async () => {
+    mockInteractionService.getForIssue.mockResolvedValue({
+      id: "interaction-participant", kind: "request_confirmation", status: "pending",
+      createdByAgentId: CREATED_AGENT_ID, addresseeAgentId: ASSIGNEE_AGENT_ID,
+      sourceRunId: RUN_1, effectiveResolverPolicy: "not_creator", payload: { version: 1, prompt: "Confirm" },
+    });
+    const app = await createApp({ type: "agent", agentId: UNRELATED_AGENT_ID, companyId: "company-1", runId: RUN_3 });
+    const response = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-participant/participate")
+      .send({});
+    expect(response.status).toBe(403);
+    expect(response.body.code).toBe("interaction_addressee_mismatch");
+  });
+
+  it("keeps participant preflight behind the company read boundary", async () => {
+    mockAccessDecide.mockResolvedValue({
+      allowed: false, action: "issue:read", reason: "deny_company_boundary",
+      explanation: "Denied by company boundary.",
+    });
+    const app = await createApp({ type: "agent", agentId: UNRELATED_AGENT_ID, companyId: "company-2", runId: RUN_CROSS_COMPANY });
+    const response = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-participant/participate")
+      .send({});
+    expect(response.status).toBe(404);
+    expect(mockInteractionService.getForIssue).not.toHaveBeenCalled();
+    expect(mockInteractionService.participate).not.toHaveBeenCalled();
+  });
+
+  it("does not turn a low-trust reviewer into a participant", async () => {
+    mockResolveCoreTrustPreset.mockReturnValueOnce({ kind: "low_trust_review" });
+    const app = await createApp({ type: "agent", agentId: UNRELATED_AGENT_ID, companyId: "company-1", runId: RUN_3 });
+    const response = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-participant/participate")
+      .send({});
+    expect(response.status).toBe(403);
+    expect(response.body.code).toBe("interaction_scope_denied");
+    expect(mockInteractionService.participate).not.toHaveBeenCalled();
+  });
+
+  it("does not bypass human-only policy for an addressed participant", async () => {
+    mockInteractionService.getForIssue.mockResolvedValue({
+      id: "interaction-participant", kind: "request_confirmation", status: "pending",
+      createdByAgentId: ASSIGNEE_AGENT_ID, addresseeAgentId: UNRELATED_AGENT_ID,
+      sourceRunId: RUN_1, effectiveResolverPolicy: "human_only",
+      payload: { version: 1, prompt: "Confirm" },
+    });
+    const app = await createApp({ type: "agent", agentId: UNRELATED_AGENT_ID, companyId: "company-1", runId: RUN_3 });
+    const response = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-participant/participate")
+      .send({});
+    expect(response.status).toBe(403);
+    expect(response.body.code).toBe("interaction_human_only");
+    expect(mockInteractionService.participate).not.toHaveBeenCalled();
+  });
+
+  it("does not give board actors a participant preflight", async () => {
+    const response = await request(await createApp())
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-participant/participate")
+      .send({});
+    expect(response.status).toBe(403);
+    expect(mockInteractionService.participate).not.toHaveBeenCalled();
   });
 
   it("allows only the addressed agent or board to resolve an addressed interaction", async () => {

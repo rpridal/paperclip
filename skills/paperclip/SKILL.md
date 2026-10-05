@@ -89,7 +89,16 @@ they mention a chat provider.
 Follow these steps every time you wake up unless the server-verified external
 chat shortcut above applies:
 
-**Scoped-wake fast path.** If the user message includes a **"Paperclip Resume Delta"** or **"Paperclip Wake Payload"** section that names a specific issue, **skip Steps 1–4 entirely**. Go straight to **Step 5 (Checkout)** for that issue, then continue with Steps 6–9. The scoped wake already tells you which issue to work on — do NOT call `/api/agents/me`, do NOT fetch your inbox, do NOT pick work. Just checkout, read the wake context, do the work, and update.
+**Addressed interaction participation takes precedence over checkout.** When the wake or task context asks you to resolve a specific existing `request_confirmation` addressed to your agent, and you are not the issue assignee, use the participant path below, not issue checkout. This includes requests to publish an independent host review after an existing native review decision. A mention alone, an unaddressed request, or a request to implement code does not qualify.
+
+1. Read `GET /api/issues/{issueId}/interactions` and identify the exact pending request addressed to `PAPERCLIP_AGENT_ID`. Preserve its `not_creator`/human-only policy; an audience is not a role grant.
+2. Before bounded work, call `POST /api/issues/{issueId}/interactions/{interactionId}/participate` with `{}` and the authenticated run header. This checks the current actor, live issue-bound run, audience, target and conflicting active work. A `403`, `409` or `422` is final for this attempt. Do not fall back to checkout, change the assignee, clear leases, or edit stages. An older server returning `404` does not support this path: stop and report the compatibility blocker.
+3. Perform only the requested confirmation work. For a formal host review, read the current PR head with the supported host API and compare the complete SHA to the request before publishing with your own independently authorized reviewer identity. Re-read the head and the published review receipt afterward. A changed head, missing exact-SHA evidence, insufficient host permissions, or a different reviewer identity means no acceptance; reject with the reason. Never infer an APPROVE from a native stage decision or use the author's/admin credentials.
+4. Resolve only this interaction via its existing `/accept` or `/reject` endpoint with the authenticated run header. For a host receipt, accept only after the actual review ID, reviewer identity, exact head and APPROVED read-back are verified; put that evidence in the issue thread using the ordinary comment authorization if allowed. Do not PATCH task status/assignment/policy, advance a stage, merge, deploy, or call issue release. The resolver revalidates current participation; the preflight is neither a lease nor a reusable capability. If resolution fails after host publication, report the receipt and failure without publishing twice.
+
+For this path, skip Steps 5 and 7–9's task lifecycle mutations. Leave the original assignee and stages unchanged. Document targets are server-checked, but external PR heads and receipts are not: the host API checks above are mandatory, not a server guarantee.
+
+**Scoped-wake fast path.** If the user message includes a **"Paperclip Resume Delta"** or **"Paperclip Wake Payload"** section that names a specific issue, **skip Steps 1–4 entirely**. First apply the addressed-interaction exception above when applicable; otherwise go straight to **Step 5 (Checkout)** for that issue, then continue with Steps 6–9. The scoped wake already tells you which issue to work on — do NOT call `/api/agents/me`, do NOT fetch your inbox, do NOT pick work.
 
 **Step 1 — Identity.** If not already in context, `GET /api/agents/me` to get your id, companyId, role, chainOfCommand, and budget.
 
@@ -115,7 +124,7 @@ Overrides and special cases:
 - **Blocked-task dedup:** before touching a `blocked` task, check the thread. If your most recent comment was a blocked-status update and no one has replied since, skip entirely — do not checkout, do not re-comment. Only re-engage on new context (comment, status change, event wake).
 - Nothing assigned and no valid mention handoff → exit the heartbeat.
 
-**Step 5 — Checkout.** You MUST checkout before doing any work. Include the run ID header:
+**Step 5 — Checkout.** You MUST checkout before task execution, except for the addressed interaction participation path above. Include the run ID header:
 
 ```
 POST /api/issues/{issueId}/checkout
@@ -657,6 +666,7 @@ If `plan` already exists, first `GET /api/issues/{issueId}/documents/plan` and r
 | Get comments / delta / single         | `GET /api/issues/:issueId/comments[?after=:commentId&order=asc]` • `/comments/:commentId`                                       |
 | Add comment                           | `POST /api/issues/:issueId/comments`                                                                                            |
 | Issue-thread interactions             | `GET\|POST /api/issues/:issueId/interactions` • `POST /api/issues/:issueId/interactions/:interactionId/{accept,reject,respond,withdraw}` |
+| Addressed participation preflight     | `POST /api/issues/:issueId/interactions/:interactionId/participate` with `{}`; no checkout or task authority                      |
 | Create subtask                        | `POST /api/companies/:companyId/issues`                                                                                         |
 | Release task                          | `POST /api/issues/:issueId/release`                                                                                             |
 | Search issues                         | `GET /api/companies/:companyId/issues?q=search+term`                                                                            |

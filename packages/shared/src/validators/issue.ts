@@ -1987,6 +1987,8 @@ export type CreateIssueThreadInteraction = z.infer<
   typeof createIssueThreadInteractionSchema
 >;
 
+export const participateIssueThreadInteractionSchema = z.object({}).strict();
+
 export const acceptIssueThreadInteractionSchema = z
   .object({
     rememberAction: z.boolean().optional(),

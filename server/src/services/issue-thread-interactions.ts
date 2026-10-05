@@ -473,6 +473,7 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
   issue: IssueResolutionContext,
   interaction: IssueThreadInteractionRow,
   actor: InteractionActor,
+  participationRequired = false,
 ) {
   if (isTerminalIssueStatus(issue.status)) {
     throw conflict(
@@ -486,6 +487,20 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
     (await isIssueReviewVerdictInteraction(tx, { issue, interaction }));
 
   assertInteractionResolutionAllowed(interaction, actor);
+  if (isReviewVerdict && participationRequired) {
+    throw forbidden("Bound issue reviews use the ordinary review decision path");
+  }
+  const scopedParticipant =
+    !isReviewVerdict && isScopedInteractionParticipant(issue, interaction, actor);
+  if (!isReviewVerdict) {
+    await assertScopedInteractionParticipationUnderLock(
+      tx,
+      issue,
+      interaction,
+      actor,
+      participationRequired,
+    );
+  }
   if (actor.agentId && isNativeCompletionReview(interaction)) {
     const target = (interaction.payload as { target?: { revisionId?: string } }).target;
     if (!actor.runId || !await getNativeReviewAssignment(tx, {
@@ -495,7 +510,7 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
       issueExecutionRunId: issue.executionRunId,
     })) throw conflict("This completion review is no longer current or assigned to this agent.");
   }
-  if (!isReviewVerdict) return;
+  if (!isReviewVerdict) return scopedParticipant;
 
   const verdictActor = actor.agentId
     ? { type: "agent" as const, id: actor.agentId }
@@ -509,6 +524,124 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
     issue,
     actor: verdictActor,
   });
+  return false;
+}
+
+function isScopedInteractionParticipant(
+  issue: IssueResolutionContext,
+  interaction: IssueThreadInteractionRow,
+  actor: InteractionActor,
+) {
+  const payload =
+    interaction.payload as RequestConfirmationInteraction["payload"];
+  return Boolean(
+    actor.agentId &&
+    interaction.kind === "request_confirmation" &&
+    interaction.addresseeAgentId === actor.agentId &&
+    issue.assigneeAgentId !== actor.agentId &&
+    !payload.toolAction &&
+    !payload.secretProposal &&
+    !(payload.target?.type === "issue_document" && payload.target.key === "plan") &&
+    !isNativeCompletionReview(interaction),
+  );
+}
+
+async function assertScopedInteractionParticipationUnderLock(
+  tx: Db,
+  issue: IssueResolutionContext,
+  interaction: IssueThreadInteractionRow,
+  actor: InteractionActor,
+  required = false,
+) {
+  if (!isScopedInteractionParticipant(issue, interaction, actor)) {
+    if (required) {
+      throw forbidden(
+        "Participation requires an addressed, non-owner confirmation resolver",
+      );
+    }
+    return;
+  }
+  const payload =
+    interaction.payload as RequestConfirmationInteraction["payload"];
+  const run = actor.runId
+    ? await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, actor.runId),
+          eq(heartbeatRuns.companyId, issue.companyId),
+          eq(heartbeatRuns.agentId, actor.agentId!),
+        ))
+        .for("update")
+        .then((rows) => rows[0] ?? null)
+    : null;
+  const context = run?.contextSnapshot;
+  if (
+    !run ||
+    run.status !== "running" ||
+    run.finishedAt ||
+    (context?.issueId ?? context?.taskId) !== issue.id ||
+    (context?.interactionId != null && context.interactionId !== interaction.id)
+  ) {
+    throw issueThreadInteractionResolutionError(
+      422,
+      "interaction_run_attribution_required",
+      "Participation requires a live run bound to this issue and interaction",
+    );
+  }
+  if (interaction.status !== "pending") throw interactionTerminalError(interaction);
+  if (payload.target?.type === "issue_document") {
+    const snapshot = await getIssueDocumentTargetSnapshot(tx, {
+      companyId: issue.companyId,
+      issueId: issue.id,
+      target: payload.target,
+      lockForUpdate: true,
+    });
+    if (
+      !snapshot ||
+      snapshot.latestRevisionId !== payload.target.revisionId ||
+      (payload.target.revisionNumber != null &&
+        snapshot.latestRevisionNumber !== payload.target.revisionNumber)
+    ) {
+      throw issueThreadInteractionResolutionError(
+        422,
+        "interaction_stale_target",
+        "The participation target is no longer current",
+      );
+    }
+  }
+  const [currentIssue] = await tx
+    .select({ checkoutRunId: issues.checkoutRunId })
+    .from(issues)
+    .where(eq(issues.id, issue.id));
+  const leaseIds = [issue.executionRunId, currentIssue?.checkoutRunId].filter(
+    (runId): runId is string => Boolean(runId) && runId !== actor.runId,
+  );
+  const conflicts = await tx
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.companyId, issue.companyId),
+      ne(heartbeatRuns.id, run.id),
+      inArray(heartbeatRuns.status, ["queued", "running"]),
+      or(
+        leaseIds.length > 0 ? inArray(heartbeatRuns.id, leaseIds) : sql`false`,
+        and(
+          sql`coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issue.id}`,
+          or(
+            eq(heartbeatRuns.agentId, run.agentId),
+            issue.assigneeAgentId
+              ? eq(heartbeatRuns.agentId, issue.assigneeAgentId)
+              : sql`false`,
+            sql`${heartbeatRuns.contextSnapshot}->>'interactionId' = ${interaction.id}`,
+          ),
+        ),
+      ),
+    ))
+    .limit(1);
+  if (conflicts.length > 0) {
+    throw conflict("Conflicting active work prevents interaction participation");
+  }
 }
 
 const REQUEST_CONFIRMATION_INTERACTION_KINDS = [
@@ -2428,7 +2561,7 @@ export function issueThreadInteractionService(
           "Interaction has already been resolved",
         );
       }
-      await assertRequestConfirmationResolutionAllowedUnderLock(
+      const scopedParticipant = await assertRequestConfirmationResolutionAllowedUnderLock(
         tx as unknown as Db,
         issueContext,
         lockedCurrent,
@@ -2493,6 +2626,7 @@ export function issueThreadInteractionService(
           issueContext.id,
         )?.key === "plan";
       const shouldResumeReviewedIssue =
+        !scopedParticipant &&
         issueContext.status === "in_review" &&
         (lockedCurrent.continuationPolicy === "wake_assignee" ||
           rejectedPlanNeedsRevision);
@@ -2528,6 +2662,46 @@ export function issueThreadInteractionService(
 
   return {
     getForIssue,
+    participate: async (
+      issue: { id: string; companyId: string },
+      interactionId: string,
+      actor: InteractionActor,
+    ) =>
+      db.transaction(async (tx) => {
+        const currentIssue = await tx
+          .select()
+          .from(issues)
+          .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!currentIssue) throw notFound("Issue not found");
+        const current = await tx
+          .select()
+          .from(issueThreadInteractions)
+          .where(and(
+            eq(issueThreadInteractions.id, interactionId),
+            eq(issueThreadInteractions.companyId, issue.companyId),
+            eq(issueThreadInteractions.issueId, issue.id),
+          ))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!current) throw interactionNotFoundError();
+        if (current.status !== "pending") throw interactionTerminalError(current);
+        await assertRequestConfirmationResolutionAllowedUnderLock(
+          tx as unknown as Db,
+          currentIssue,
+          current,
+          actor,
+          true,
+        );
+        return {
+          interactionId: current.id,
+          runId: actor.runId!,
+          scope: "interaction" as const,
+          allowedActions: ["accept", "reject"] as const,
+          interaction: hydrateInteraction(current),
+        };
+      }),
     createConnectionIntent: async (
       issue: { id: string; companyId: string },
       input: {

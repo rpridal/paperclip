@@ -754,6 +754,28 @@ decisions, and every other downstream effect must re-run its own authorization a
 approval checks. Mislabeling a governed action as an open interaction grants no
 downstream capability.
 
+An agent addressed by a pending `request_confirmation` may perform the bounded
+confirmation work without checking out or taking ownership of the issue. The
+agent first calls `POST /api/issues/:issueId/interactions/:interactionId/participate`
+with an empty object. This is a stateless preflight, not a participant grant or
+lease. The server requires a live run for that agent, company, and issue; an
+interaction ID in run context must match when present. Audience and current
+resolver-policy restrictions still apply. A conflicting active owner, checkout or
+execution run, another active run for the same reviewer on the issue, or active
+work on the same interaction denies the attempt. Document targets must remain
+current. Accept and reject revalidate these conditions under the issue and
+interaction locks.
+
+This path excludes issue owners, governed tool/secret actions, plan approvals,
+and bound issue or native-completion reviews, which keep their existing decision
+paths. It does not authorize task status, assignment, policy, or stage changes.
+Accepting or rejecting a participant confirmation preserves the native issue
+status and execution stages, including when its continuation wakes the assignee.
+External host heads and review receipts are not server-verified by this preflight.
+A host-review participant must check the exact head through the host API before
+publication and verify the published receipt and head afterward. See
+`doc/reviewer-participation.md` for the bridge and upgrade limits.
+
 ## 9.9 Task Watchdog Authority Contract
 
 A task watchdog is a scoped execution capacity for a configured watchdog agent on one watched issue subtree. It is not a separate principal, does not inherit board auth, and does not expand the selected agent's company boundary. The server must enforce the watchdog contract from persisted watchdog configuration and run context; custom instructions and prompt text can narrow the mandate but cannot expand it.
