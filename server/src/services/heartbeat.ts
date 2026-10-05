@@ -23014,7 +23014,12 @@ export function heartbeatService(
 
         const onLegacyToolApproval = async (approval: import("@paperclipai/adapter-utils").AdapterLegacyToolApproval) => {
           const activeRun = await getRun(currentRun.id);
-          if (!activeRun || activeRun.status !== "running") return;
+          if (!activeRun) return;
+          if (activeRun.status !== "running" ||
+              parseObject(parseObject(activeRun.resultJson).executionCancellation).state === "requested") {
+            clearLegacyToolApprovalsForRun(currentRun.id);
+            return;
+          }
           // Persist only public, typed identifiers; the adapter retains its bearer credential
           // inside the process-local resolver closure.
           const registered = registerLegacyToolApproval({
@@ -28849,6 +28854,9 @@ export function heartbeatService(
     reason = "Cancelled by control plane",
     options: CancelRunOptions = {},
   ) {
+    // Internal callers also revoke consent synchronously, even if lookup or
+    // termination fails. Only this immutable run identity is fenced.
+    clearLegacyToolApprovalsForRun(runId);
     let run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     const pendingNativeRetry =

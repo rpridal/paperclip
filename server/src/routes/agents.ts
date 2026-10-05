@@ -6816,6 +6816,8 @@ export function agentRoutes(
     // Stamp the cancellation as operator-initiated (this route is board-only).
     // Recovery reads this to stand down instead of classifying the cancelled
     // run as agent stranding and re-waking the agent the operator just stopped.
+    // Synchronous consent fence before cancellation yields to provider/DB I/O.
+    clearLegacyToolApprovalsForRun(runId);
     const run = await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
       resultJson: {
         cancelledByActorType: "user",
@@ -7057,7 +7059,9 @@ export function agentRoutes(
     if (choice !== "once" && choice !== "deny") throw badRequest("Approval choice must be once or deny.");
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
-    if (existing.status !== "running") {
+    if (existing.status !== "running" ||
+        parseObject(parseObject(existing.resultJson).executionCancellation).state === "requested") {
+      clearLegacyToolApprovalsForRun(runId);
       throw conflict("This run is no longer accepting tool approval responses.");
     }
     const pending = getLegacyToolApproval({ runId, requestId });
