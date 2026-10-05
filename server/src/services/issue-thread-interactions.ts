@@ -468,6 +468,16 @@ type IssueResolutionContext = {
   createdByUserId: string | null;
 };
 
+async function isActiveIssueReviewVerdict(
+  tx: Db,
+  issue: IssueResolutionContext,
+  interaction: IssueThreadInteractionRow,
+) {
+  return issue.status === "in_review" &&
+    isRequestConfirmationLikeKind(interaction.kind) &&
+    await isIssueReviewVerdictInteraction(tx, { issue, interaction });
+}
+
 async function assertRequestConfirmationResolutionAllowedUnderLock(
   tx: Db,
   issue: IssueResolutionContext,
@@ -481,10 +491,7 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
     );
   }
 
-  const isReviewVerdict =
-    issue.status === "in_review" &&
-    isRequestConfirmationLikeKind(interaction.kind) &&
-    (await isIssueReviewVerdictInteraction(tx, { issue, interaction }));
+  const isReviewVerdict = await isActiveIssueReviewVerdict(tx, issue, interaction);
 
   assertInteractionResolutionAllowed(interaction, actor);
   if (isReviewVerdict && participationRequired) {
@@ -2278,7 +2285,7 @@ export function issueThreadInteractionService(
       }
       if (
         !isScopedInteractionParticipant(issueContext, lockedCurrent, args.actor) ||
-        await isIssueReviewVerdictInteraction(tx as unknown as Db, { issue: issueContext, interaction: lockedCurrent })
+        await isActiveIssueReviewVerdict(tx as unknown as Db, issueContext, lockedCurrent)
       ) {
         const expired = await expireStaleRequestConfirmationTarget(tx, {
           row: lockedCurrent,
@@ -2554,7 +2561,7 @@ export function issueThreadInteractionService(
       }
       if (
         !isScopedInteractionParticipant(issueContext, lockedCurrent, args.actor) ||
-        await isIssueReviewVerdictInteraction(tx as unknown as Db, { issue: issueContext, interaction: lockedCurrent })
+        await isActiveIssueReviewVerdict(tx as unknown as Db, issueContext, lockedCurrent)
       ) {
         const expired = await expireStaleRequestConfirmationTarget(tx, {
           row: lockedCurrent,

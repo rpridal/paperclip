@@ -255,8 +255,19 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       await expect(interactionsSvc.participate(issue, interaction.id, actor)).rejects.toMatchObject({ status: 422 });
     });
 
-    it.each(["accept", "reject"] as const)("denies an ended reviewer %s on a stale target without any mutation", async (action) => {
-      const { issue, actor, interaction } = await seedParticipant();
+    it.each([
+      ["accept", "in_review", false],
+      ["reject", "in_review", false],
+      ["accept", "blocked", true],
+      ["reject", "blocked", true],
+      ["accept", "in_progress", true],
+      ["reject", "in_progress", true],
+    ] as const)("denies an ended reviewer %s on a stale %s target with prior review=%s without any mutation", async (action, issueStatus, priorReview) => {
+      const { issue, actor, interaction, creatorId } = await seedParticipant();
+      if (priorReview) {
+        await db.insert(activityLog).values({ companyId: issue.companyId, actorType: "agent", actorId: creatorId, action: "issue.updated", entityType: "issue", entityId: issue.id, details: { status: "in_review", _previous: { status: "in_progress" } } });
+      }
+      await db.update(issues).set({ status: issueStatus }).where(eq(issues.id, issue.id));
       const target = await attachPlanDocument(issue.companyId, issue.id);
       await db.update(issueDocuments).set({ key: "review-evidence" }).where(eq(issueDocuments.documentId, target.documentId));
       await db.update(issueThreadInteractions).set({ payload: { ...interaction.payload, target: { ...target, key: "review-evidence" } } }).where(eq(issueThreadInteractions.id, interaction.id));
