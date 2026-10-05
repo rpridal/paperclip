@@ -398,6 +398,15 @@ function extractRunId(value: unknown): string | null {
   return nonEmpty(record?.run_id) ?? nonEmpty(record?.runId) ?? nonEmpty(record?.id);
 }
 
+async function fetchJsonBounded(input: RequestInfo | URL, init: RequestInit, deadlineMs = 5_000): Promise<unknown> {
+  const deadline = AbortSignal.timeout(deadlineMs);
+  const signal = init.signal ? AbortSignal.any([init.signal, deadline]) : deadline;
+  signal.throwIfAborted();
+  const result = await fetchJson(input, { ...init, signal });
+  signal.throwIfAborted();
+  return result;
+}
+
 function eventNameFromData(data: unknown, fallback: string | null): string | null {
   const record = asRecord(data);
   return nonEmpty(record?.event) ?? nonEmpty(record?.type) ?? fallback;
@@ -777,10 +786,10 @@ async function stopRun(input: {
   redactText?: TextRedactor;
 }): Promise<Record<string, unknown> | null> {
   try {
-    const stopped = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}/stop`), {
+    const stopped = await fetchJsonBounded(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}/stop`), {
       method: "POST",
       headers: input.headers,
-    });
+    }, STOP_GRACE_MS);
     await input.ctx.onLog("stdout", `[hermes-gateway] stop requested for run ${input.runId}\n`);
     return asRecord(stopped);
   } catch (err) {
@@ -798,12 +807,14 @@ async function fetchFinalStatus(input: {
   const deadline = Date.now() + input.deadlineMs;
   while (Date.now() < deadline) {
     try {
-      const status = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}`), {
+      const status = await fetchJsonBounded(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}`), {
         method: "GET",
         headers: input.headers,
-      });
+      }, Math.max(1, deadline - Date.now()));
       const record = asRecord(status);
       const normalized = extractStatus(status);
+      const reportedRunId = extractRunId(status);
+      if (reportedRunId && reportedRunId !== input.runId) return null;
       if (normalized && TERMINAL_STATUSES.has(normalized)) return record;
     } catch {
       return null;
@@ -937,16 +948,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   await ctx.onLog("stdout", `[hermes-gateway] request headers (redacted): ${stringifyForLog(redactForLog(runHeaders, [], 0, redactText), 3_000)}\n`);
 
   let runId: string | null = null;
+  let createRequestDispatched = false;
   try {
+    await ctx.onCancellationReady?.();
+    ctx.signal?.throwIfAborted();
     // This adapter has no local child process, so crossing into the first
     // remote create request is its dispatch boundary. Report it before the
     // request can block so continuation gates may release their issue lock.
     ctx.onDispatch?.();
-    const created = await fetchJson(createRunUrl, {
+    createRequestDispatched = true;
+    const created = await fetchJsonBounded(createRunUrl, {
       method: "POST",
       headers: runHeaders,
       body: JSON.stringify(body),
-    });
+      signal: ctx.signal,
+    }, STOP_GRACE_MS);
     runId = extractRunId(created);
     if (!runId) {
       return {
@@ -959,6 +975,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
   } catch (err) {
+    if (ctx.signal?.aborted) {
+      return {
+        exitCode: 1,
+        signal: "SIGTERM",
+        timedOut: false,
+        errorCode: createRequestDispatched ? "hermes_gateway_cancellation_unconfirmed" : "hermes_gateway_cancelled_before_dispatch",
+        errorMessage: createRequestDispatched
+          ? "Hermes run creation was cancelled without a provider run id; provider work may still be running."
+          : "Hermes run was cancelled before provider dispatch.",
+        errorMeta: { createRequestDispatched, providerTerminationConfirmed: false },
+      };
+    }
     return errorResult(err, redactText);
   }
 
@@ -972,12 +1000,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     accept: "application/json",
     contentType: "application/json",
   });
+  const controller = new AbortController();
   const resolveLegacyApproval = async (requestId: string, choice: "once" | "deny") => {
-    const ack = asRecord(await fetchJson(apiUrl(baseUrl, `/v1/runs/${encodeURIComponent(runId)}/approval`), {
+    ctx.signal?.throwIfAborted();
+    controller.signal.throwIfAborted();
+    const ack = asRecord(await fetchJsonBounded(apiUrl(baseUrl, `/v1/runs/${encodeURIComponent(runId)}/approval`), {
       method: "POST",
       headers: approvalHeaders,
       // Hermes requires the exact provider request id; do not use session or a synthetic turn id.
       body: JSON.stringify({ request_id: requestId, choice }),
+      signal: controller.signal,
     }));
     if (ack?.run_id !== runId || ack.request_id !== requestId || ack.choice !== choice || ack.resolved !== 1) {
       // Delivery may already have happened. Report unknown, never retry this POST.
@@ -985,7 +1017,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   };
   const state = createExecutionState(runId);
-  const controller = new AbortController();
+  let resolveCancellation: () => void = () => undefined;
+  const cancellationPromise = new Promise<"cancelled">((resolve) => {
+    resolveCancellation = () => resolve("cancelled");
+  });
+  const onCancel = () => {
+    controller.abort();
+    resolveCancellation();
+  };
+  ctx.signal?.addEventListener("abort", onCancel, { once: true });
+  if (ctx.signal?.aborted) onCancel();
   void consumeEvents({
     ctx,
     baseUrl,
@@ -1013,23 +1054,37 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     timeoutTimer = setTimeout(() => resolve("timeout"), timeoutMs);
   });
 
-  const outcome = await Promise.race([state.terminalPromise, timeoutPromise]);
+  let outcome: Awaited<typeof state.terminalPromise> | "timeout" | "cancelled";
+  try {
+    outcome = await Promise.race([state.terminalPromise, timeoutPromise, cancellationPromise]);
+  } finally {
+    ctx.signal?.removeEventListener("abort", onCancel);
+    controller.abort();
+  }
   if (timeoutTimer) clearTimeout(timeoutTimer);
   controller.abort();
 
-  if (outcome === "timeout") {
-    await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
-    const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+  if (outcome === "timeout" || outcome === "cancelled") {
+    const stopped = await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
+    const stoppedStatus = extractStatus(stopped);
+    const finalStatus = extractRunId(stopped) === runId && stoppedStatus && TERMINAL_STATUSES.has(stoppedStatus)
+      ? stopped
+      : await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+    const terminationConfirmed = Boolean(finalStatus);
     return {
       exitCode: 1,
-      signal: null,
-      timedOut: true,
-      errorCode: "hermes_gateway_timeout",
-      errorMessage: `Hermes gateway run timed out after ${timeoutSec}s.`,
+      signal: outcome === "cancelled" ? "SIGTERM" : null,
+      timedOut: outcome === "timeout",
+      errorCode: outcome === "timeout" ? "hermes_gateway_timeout"
+        : terminationConfirmed ? "hermes_gateway_cancelled" : "hermes_gateway_cancellation_unconfirmed",
+      errorMessage: outcome === "timeout" ? `Hermes gateway run timed out after ${timeoutSec}s.`
+        : terminationConfirmed ? "Hermes gateway run cancellation was verified."
+          : "Hermes gateway run cancellation could not be verified; provider work may still be running.",
+      errorMeta: { providerTerminationConfirmed: terminationConfirmed },
       provider: "hermes_gateway",
       resultJson: {
         run_id: runId,
-        status: extractStatus(finalStatus) ?? "timeout",
+        status: extractStatus(finalStatus) ?? "unknown",
         last_event: state.lastEventName,
         final_status: redactForLog(finalStatus, [], 0, redactText),
       },
