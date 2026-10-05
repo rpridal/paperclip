@@ -54,6 +54,8 @@ type ExecutionState = {
   lastEventName: string | null;
   /** Never re-register a consent after an SSE reconnect or status poll. */
   reportedApprovalRequestIds: Set<string>;
+  /** Shared publication fence for in-flight SSE and polling callbacks. */
+  lifecycleClosed: boolean;
   terminal: TerminalState | null;
   resolveTerminal: (state: TerminalState) => void;
   terminalPromise: Promise<TerminalState>;
@@ -454,6 +456,7 @@ function createExecutionState(runId: string): ExecutionState {
     outputChunks: [],
     lastEventName: null,
     reportedApprovalRequestIds: new Set(),
+    lifecycleClosed: false,
     terminal: null,
     resolveTerminal,
     terminalPromise,
@@ -462,6 +465,7 @@ function createExecutionState(runId: string): ExecutionState {
 
 function markTerminal(state: ExecutionState, terminal: TerminalState): void {
   if (state.terminal) return;
+  state.lifecycleClosed = true;
   state.terminal = terminal;
   state.resolveTerminal(terminal);
 }
@@ -507,9 +511,12 @@ async function reportLegacyApproval(
   resolve: (requestId: string, choice: "once" | "deny") => Promise<void>,
 ): Promise<void> {
   const requestId = approvalRequestId(eventName, record, state.runId);
+  if (state.lifecycleClosed || state.terminal || ctx.signal?.aborted) return;
   if (!requestId || state.reportedApprovalRequestIds.has(requestId)) return;
   state.reportedApprovalRequestIds.add(requestId);
   if (!ctx.onLegacyToolApproval) return;
+  // No await between this lifecycle check and callback publication.
+  if (state.lifecycleClosed || state.terminal || ctx.signal?.aborted) return;
   await ctx.onLegacyToolApproval({
     provider: "hermes_gateway",
     providerRunId: state.runId,
@@ -529,11 +536,17 @@ async function handleEvent(
   const parsed = parseJsonData(frame.data);
   const record = asRecord(parsed);
   const eventName = eventNameFromData(parsed, frame.event);
+  const status = extractStatus(parsed) ?? (eventName?.startsWith("run.") ? eventName.slice(4) : null);
+  const isTerminal = Boolean(status && TERMINAL_STATUSES.has(status));
+  if (state.lifecycleClosed || ctx.signal?.aborted) return;
+  // Observe terminal consent closure before any asynchronous log callback.
+  if (isTerminal) state.lifecycleClosed = true;
   state.lastEventName = eventName;
   await ctx.onLog(
     "stdout",
     `[hermes-gateway:event] run=${state.runId} event=${eventName ?? "message"} data=${stringifyForLog(redactForLog(parsed, [], 0, redactText), 8_000)}\n`,
   );
+  if ((state.lifecycleClosed && !isTerminal) || ctx.signal?.aborted) return;
   if (resolveLegacyApproval) {
     await reportLegacyApproval(ctx, state, eventName, record, resolveLegacyApproval);
   }
@@ -555,7 +568,6 @@ async function handleEvent(
     await ctx.onLog("stdout", sanitizedDelta);
   }
 
-  const status = extractStatus(parsed) ?? (eventName?.startsWith("run.") ? eventName.slice(4) : null);
   if (status && TERMINAL_STATUSES.has(status)) {
     markTerminal(state, {
       runId: state.runId,
@@ -603,6 +615,16 @@ async function pollStatus(input: {
       });
       const normalized = extractStatus(status);
       const record = asRecord(status);
+      if (input.signal.aborted || input.state.lifecycleClosed) return;
+      if (normalized && TERMINAL_STATUSES.has(normalized)) {
+        markTerminal(input.state, {
+          runId: input.state.runId,
+          status: normalized,
+          payload: record,
+          output: extractOutput(status),
+        });
+        return;
+      }
       await reportLegacyApproval(
         input.ctx,
         input.state,
@@ -610,14 +632,6 @@ async function pollStatus(input: {
         record,
         input.resolveLegacyApproval ?? (async () => undefined),
       );
-      if (normalized && TERMINAL_STATUSES.has(normalized)) {
-        markTerminal(input.state, {
-          runId: input.state.runId,
-          status: normalized,
-          payload: asRecord(status),
-          output: extractOutput(status),
-        });
-      }
     } catch (err) {
       if (input.signal.aborted) return;
       await input.ctx.onLog("stderr", `[hermes-gateway] status poll failed: ${redactErrorMessage(err, input.redactText)}\n`);
@@ -814,7 +828,7 @@ async function fetchFinalStatus(input: {
       const record = asRecord(status);
       const normalized = extractStatus(status);
       const reportedRunId = extractRunId(status);
-      if (reportedRunId && reportedRunId !== input.runId) return null;
+      if (reportedRunId !== input.runId) return null;
       if (normalized && TERMINAL_STATUSES.has(normalized)) return record;
     } catch {
       return null;
@@ -1001,9 +1015,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     contentType: "application/json",
   });
   const controller = new AbortController();
+  const state = createExecutionState(runId);
   const resolveLegacyApproval = async (requestId: string, choice: "once" | "deny") => {
     ctx.signal?.throwIfAborted();
     controller.signal.throwIfAborted();
+    if (state.lifecycleClosed) throw new Error("Hermes run consent lifecycle is closed.");
     const ack = asRecord(await fetchJsonBounded(apiUrl(baseUrl, `/v1/runs/${encodeURIComponent(runId)}/approval`), {
       method: "POST",
       headers: approvalHeaders,
@@ -1016,12 +1032,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       throw new Error("Hermes approval acknowledgement did not match the exact request.");
     }
   };
-  const state = createExecutionState(runId);
   let resolveCancellation: () => void = () => undefined;
   const cancellationPromise = new Promise<"cancelled">((resolve) => {
     resolveCancellation = () => resolve("cancelled");
   });
   const onCancel = () => {
+    state.lifecycleClosed = true;
     controller.abort();
     resolveCancellation();
   };
@@ -1051,13 +1067,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<"timeout">((resolve) => {
     if (timeoutMs <= 0) return;
-    timeoutTimer = setTimeout(() => resolve("timeout"), timeoutMs);
+    timeoutTimer = setTimeout(() => {
+      state.lifecycleClosed = true;
+      controller.abort();
+      resolve("timeout");
+    }, timeoutMs);
   });
 
   let outcome: Awaited<typeof state.terminalPromise> | "timeout" | "cancelled";
   try {
     outcome = await Promise.race([state.terminalPromise, timeoutPromise, cancellationPromise]);
   } finally {
+    state.lifecycleClosed = true;
     ctx.signal?.removeEventListener("abort", onCancel);
     controller.abort();
   }

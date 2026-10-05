@@ -4,7 +4,7 @@ import { describe, it, expect } from 'vitest';
 import type { AdapterExecutionContext, AdapterLegacyToolApproval } from '@paperclipai/adapter-utils';
 import { execute } from '../../../packages/adapters/hermes/src/gateway/server/execute.js';
 
-async function fixture(mode: 'headers' | 'body', wrongTerminalRun = false, creation: 'normal' | 'pre-cancelled' | 'body' = 'normal', stopMode: 'normal' | 'headers' | 'body' = 'normal') {
+async function fixture(mode: 'headers' | 'body', wrongTerminalRun = false, creation: 'normal' | 'pre-cancelled' | 'body' = 'normal', stopMode: 'normal' | 'headers' | 'body' = 'normal', review: { missingFinalId?: boolean; skipPending?: boolean; pollApproval?: boolean; terminalSse?: boolean; onLog?: AdapterExecutionContext['onLog']; onApproval?: () => void } = {}) {
   let pending: AdapterLegacyToolApproval | undefined;
   let posts = 0;
   let stops = 0;
@@ -21,7 +21,9 @@ async function fixture(mode: 'headers' | 'body', wrongTerminalRun = false, creat
       else res.end(JSON.stringify({ run_id: runId }));
     }
     else if (req.url?.endsWith('/events')) {
+      if (review.pollApproval) { res.statusCode = 503; res.end(); return; }
       res.setHeader('Content-Type', 'text/event-stream');
+      if (completed && review.terminalSse) { res.end(`event: run.completed\ndata: ${JSON.stringify({ run_id: runId, status: 'completed' })}\n\n`); return; }
       res.end(`event: approval.request\ndata: ${JSON.stringify({ event: 'approval.request', run_id: runId, request_id: requestId })}\n\n`);
     } else if (req.url?.endsWith('/approval')) {
       for await (const _chunk of req) { /* consume without executing anything */ }
@@ -32,7 +34,7 @@ async function fixture(mode: 'headers' | 'body', wrongTerminalRun = false, creat
       stops++; completed = true;
       if (stopMode === 'normal') res.end(JSON.stringify({ run_id: wrongTerminalRun ? 'other-provider' : runId, status: 'cancelled' }));
       else if (stopMode === 'body') { res.writeHead(200); res.write('{"run_id":'); }
-    } else res.end(JSON.stringify({ run_id: completed && wrongTerminalRun ? 'other-provider' : runId, status: completed ? 'completed' : 'waiting_for_approval' }));
+    } else res.end(JSON.stringify({ run_id: completed && review.missingFinalId ? undefined : completed && wrongTerminalRun ? 'other-provider' : runId, status: completed && !review.terminalSse ? 'completed' : 'waiting_for_approval', ...(review.pollApproval ? { approval: { event: 'approval.request', run_id: runId, request_id: requestId } } : {}) }));
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const addr = server.address(); if (!addr || typeof addr === 'string') throw new Error('port');
@@ -41,11 +43,11 @@ async function fixture(mode: 'headers' | 'body', wrongTerminalRun = false, creat
     signal: controller.signal,
     runId: 'abort-paperclip', agent: { id: 'fixture', companyId: 'fixture', name: 'fixture', adapterType: 'hermes_gateway', adapterConfig: config },
     config, context: {}, runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-    onLog: async () => {}, onLegacyToolApproval: async value => { pending = value; },
+    onLog: review.onLog ?? (async () => {}), onLegacyToolApproval: async value => { pending = value; review.onApproval?.(); },
   };
   if (creation === 'pre-cancelled') controller.abort();
   const execution = execute(ctx);
-  if (creation === 'normal') await expect.poll(() => pending, { timeout: 1000 }).toBeDefined();
+  if (creation === 'normal' && !review.skipPending) await expect.poll(() => pending, { timeout: 1000 }).toBeDefined();
   if (creation === 'body') await expect.poll(() => creations, { timeout: 1000 }).toBe(1);
   return { pending: pending!, execution, controller, posts: () => posts, stops: () => stops,
     creations: () => creations,
@@ -66,6 +68,71 @@ async function observe(promise: Promise<unknown>, ms: number) {
 }
 
 describe('bounded exact resolver HTTP I/O', () => {
+  it.each(['cancel', 'terminal'] as const)('review: does not publish consent after %s while event logging is deferred', async ending => {
+    let release!: () => void;
+    let entered = false;
+    let approvals = 0;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const disposable = await fixture('headers', false, 'normal', 'normal', {
+      skipPending: true,
+      onApproval: () => { approvals++; },
+      onLog: async (_stream, text) => {
+        if (text.includes('event=approval.request')) { entered = true; await gate; }
+      },
+    });
+    try {
+      await expect.poll(() => entered, { timeout: 1000 }).toBe(true);
+      if (ending === 'cancel') disposable.controller.abort();
+      else disposable.complete();
+      const result = await disposable.execution;
+      if (ending === 'cancel') expect(result.errorMeta).toEqual({ providerTerminationConfirmed: true });
+      else expect(result.exitCode).toBe(0);
+      release();
+      await new Promise(resolve => setTimeout(resolve, 40));
+      expect(approvals).toBe(0);
+      expect(disposable.posts()).toBe(0);
+    } finally { release(); await disposable.close(); }
+  });
+  it('review: terminal polling envelope never publishes its stale approval', async () => {
+    let approvals = 0;
+    const disposable = await fixture('headers', false, 'normal', 'normal', {
+      skipPending: true, pollApproval: true, onApproval: () => { approvals++; },
+    });
+    try {
+      disposable.complete();
+      expect((await disposable.execution).exitCode).toBe(0);
+      expect(approvals).toBe(0);
+      expect(disposable.posts()).toBe(0);
+    } finally { await disposable.close(); }
+  });
+  it('review: terminal SSE fences an old resolver before deferred terminal logging completes', async () => {
+    let release!: () => void;
+    let entered = false;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const disposable = await fixture('headers', false, 'normal', 'normal', {
+      terminalSse: true,
+      onLog: async (_stream, text) => {
+        if (text.includes('event=run.completed')) { entered = true; await gate; }
+      },
+    });
+    try {
+      disposable.complete();
+      await expect.poll(() => entered, { timeout: 1000 }).toBe(true);
+      expect(await observe(disposable.pending.resolve('once'), 100)).toBe('rejected');
+      expect(disposable.posts()).toBe(0);
+      release();
+      expect((await disposable.execution).exitCode).toBe(0);
+    } finally { release(); await disposable.close(); }
+  });
+  it('review: missing run id in final status is not exact termination proof', async () => {
+    const disposable = await fixture('headers', true, 'normal', 'normal', { missingFinalId: true });
+    try {
+      disposable.controller.abort();
+      const result = await disposable.execution;
+      expect(result.errorMeta).toEqual({ providerTerminationConfirmed: false });
+      expect(result.errorCode).toBe('hermes_gateway_cancellation_unconfirmed');
+    } finally { await disposable.close(); }
+  });
   it('cancellation before creation dispatch sends no provider request', async () => {
     const disposable = await fixture('headers', false, 'pre-cancelled');
     try {
