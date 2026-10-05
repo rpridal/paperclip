@@ -255,6 +255,27 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       await expect(interactionsSvc.participate(issue, interaction.id, actor)).rejects.toMatchObject({ status: 422 });
     });
 
+    it.each(["accept", "reject"] as const)("denies an ended reviewer %s on a stale target without any mutation", async (action) => {
+      const { issue, actor, interaction } = await seedParticipant();
+      const target = await attachPlanDocument(issue.companyId, issue.id);
+      await db.update(issueDocuments).set({ key: "review-evidence" }).where(eq(issueDocuments.documentId, target.documentId));
+      await db.update(issueThreadInteractions).set({ payload: { ...interaction.payload, target: { ...target, key: "review-evidence" } } }).where(eq(issueThreadInteractions.id, interaction.id));
+      await db.update(documents).set({ latestRevisionId: randomUUID() }).where(eq(documents.id, target.documentId));
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, actor.runId));
+      const [beforeInteraction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id));
+      const [beforeIssue] = await db.select().from(issues).where(eq(issues.id, issue.id));
+
+      const resolution = action === "accept"
+        ? interactionsSvc.acceptInteraction(issue, interaction.id, {}, actor)
+        : interactionsSvc.rejectInteraction(issue, interaction.id, { reason: "The host head changed" }, actor);
+      await expect(resolution).rejects.toMatchObject({ status: 422, details: { code: "interaction_run_attribution_required" } });
+
+      const [afterInteraction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id));
+      const [afterIssue] = await db.select().from(issues).where(eq(issues.id, issue.id));
+      expect(afterInteraction).toEqual(beforeInteraction);
+      expect(afterIssue).toEqual(beforeIssue);
+    });
+
     it("denies active owner work even when no lease pointer is set", async () => {
       const { issue, actor, interaction, creatorId } = await seedParticipant();
       await db.insert(heartbeatRuns).values({

@@ -2223,16 +2223,6 @@ export function issueThreadInteractionService(
     interaction: IssueThreadInteraction;
     continuationIssue: IssueWakeTarget | null;
   }> {
-    const expired = await expireStaleRequestConfirmationTarget(db, {
-      row: args.current,
-      actor: args.actor,
-    });
-    if (expired)
-      throw interactionTerminalError({
-        status: expired.status,
-        result: expired.result,
-      });
-
     const now = new Date();
     const postCommitActivityPublications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
@@ -2285,6 +2275,16 @@ export function issueThreadInteractionService(
           "interaction_already_resolved",
           "Interaction has already been resolved",
         );
+      }
+      if (
+        !isScopedInteractionParticipant(issueContext, lockedCurrent, args.actor) ||
+        await isIssueReviewVerdictInteraction(tx as unknown as Db, { issue: issueContext, interaction: lockedCurrent })
+      ) {
+        const expired = await expireStaleRequestConfirmationTarget(tx, {
+          row: lockedCurrent,
+          actor: args.actor,
+        });
+        if (expired) return { interaction: expired, continuationIssue: null, expired: true };
       }
       await assertRequestConfirmationResolutionAllowedUnderLock(
         tx as unknown as Db,
@@ -2478,6 +2478,7 @@ export function issueThreadInteractionService(
         continuationIssue,
       };
     });
+    if ("expired" in result) throw interactionTerminalError(result.interaction);
     for (const publication of postCommitActivityPublications)
       publishActivity(publication);
     await emitInteractionResolvedTelemetry(db, result.interaction);
@@ -2491,16 +2492,6 @@ export function issueThreadInteractionService(
     actor: InteractionActor;
     mutationOptions?: InteractionResolutionMutationOptions;
   }): Promise<IssueThreadInteraction> {
-    const expired = await expireStaleRequestConfirmationTarget(db, {
-      row: args.current,
-      actor: args.actor,
-    });
-    if (expired)
-      throw interactionTerminalError({
-        status: expired.status,
-        result: expired.result,
-      });
-
     const interaction = hydrateInteraction(
       args.current,
     ) as RequestConfirmationLikeInteraction;
@@ -2560,6 +2551,16 @@ export function issueThreadInteractionService(
           "interaction_already_resolved",
           "Interaction has already been resolved",
         );
+      }
+      if (
+        !isScopedInteractionParticipant(issueContext, lockedCurrent, args.actor) ||
+        await isIssueReviewVerdictInteraction(tx as unknown as Db, { issue: issueContext, interaction: lockedCurrent })
+      ) {
+        const expired = await expireStaleRequestConfirmationTarget(tx, {
+          row: lockedCurrent,
+          actor: args.actor,
+        });
+        if (expired) return { expired };
       }
       const scopedParticipant = await assertRequestConfirmationResolutionAllowedUnderLock(
         tx as unknown as Db,
@@ -2655,6 +2656,7 @@ export function issueThreadInteractionService(
       return resolved;
     });
 
+    if ("expired" in updated) throw interactionTerminalError(updated.expired);
     const rejected = hydrateInteraction(updated);
     await emitInteractionResolvedTelemetry(db, rejected);
     return rejected;
