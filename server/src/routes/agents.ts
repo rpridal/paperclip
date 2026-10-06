@@ -82,6 +82,7 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
@@ -5773,6 +5774,15 @@ export function agentRoutes(
     } else {
       await assertBoardCanWakeAgent(req, agent);
     }
+    if (req.body.pendingInteraction && (
+      (opts.source ?? "on_demand") !== "on_demand" ||
+      (req.body.triggerDetail ?? "manual") !== "manual" ||
+      (req.body.reason != null && req.body.reason !== "interaction_pending") ||
+      req.body.payload != null || req.body.failedRunId ||
+      req.body.forceFreshSession === true || req.body.debug
+    )) {
+      throw badRequest("Pending interaction recovery cannot override its execution context.");
+    }
     if (req.body.debug?.providerTrace === "raw") {
       assertInstanceAdmin(req);
     }
@@ -5785,6 +5795,25 @@ export function agentRoutes(
 
     let wakePayload = req.body.payload ?? null;
     let retryConversationContext: Record<string, unknown> = {};
+    if (req.body.pendingInteraction) {
+      const selection = req.body.pendingInteraction;
+      const issue = await issueService(db).getById(selection.issueId);
+      if (!issue || issue.companyId !== agent.companyId) throw notFound("Task not found");
+      const decision = await access.decide({
+        actor: req.actor, action: "issue:comment",
+        resource: {
+          type: "issue", companyId: issue.companyId, issueId: issue.id,
+          projectId: issue.projectId, parentIssueId: issue.parentId,
+          assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId, status: issue.status,
+        },
+      });
+      if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+      const prepared = await issueThreadInteractionService(db).preparePendingConfirmationWake({
+        companyId: agent.companyId, agentId: agent.id, ...selection,
+      });
+      wakePayload = prepared.payload;
+      retryConversationContext = prepared.contextSnapshot;
+    }
     if (req.body.failedRunId) {
       assertBoard(req);
       if (
@@ -5929,7 +5958,7 @@ export function agentRoutes(
       ...(req.actor.type === "board" && !req.body.failedRunId ? { manualUserWake: true } : {}),
       source: opts.source,
       triggerDetail: req.body.triggerDetail ?? "manual",
-      reason: req.body.reason ?? null,
+      reason: req.body.pendingInteraction ? "interaction_pending" : req.body.reason ?? null,
       payload: req.actor.type === "agent" && wakePayload
         ? { ...wakePayload, commentId: undefined, wakeCommentId: undefined, wakeCommentIds: undefined }
         : wakePayload,
@@ -6002,6 +6031,9 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/heartbeat/invoke", async (req, res) => {
+    if (req.body?.pendingInteraction !== undefined) {
+      throw badRequest("Use the wakeup endpoint to recover a pending interaction.");
+    }
     // Legacy endpoint. Hardcodes `source: "on_demand"` (the prior behavior
     // before the wakeup/invoke convergence). Reads scope fields directly off
     // the body without `validate(wakeAgentSchema)` because callers — including

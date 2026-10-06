@@ -3615,7 +3615,7 @@ registry.registerPath({
   tags: ["agents"],
   summary: "Wake up an agent",
   description:
-    "Board failed-run retries supply failedRunId with reason retry_failed_run. Paperclip derives the exact request and current authorization; a chat retry may return a durable queued/deferred receipt before a run exists. Caller task/comment markers and fresh-session overrides do not authorize replay.",
+    "Board failed-run retries supply failedRunId with reason retry_failed_run. Paperclip derives the exact request and current authorization; a chat retry may return a durable queued/deferred receipt before a run exists. Caller task/comment markers and fresh-session overrides do not authorize replay. To recover an existing pending addressed confirmation, supply pendingInteraction with issueId and interactionId. Paperclip checks agent-wake and issue-comment access and constructs the scope from the current stored interaction. Recovery must use on-demand/manual dispatch without payload, failedRunId, debug or fresh-session overrides. Queued and final dispatch guards remain required.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(wakeAgentSchema),

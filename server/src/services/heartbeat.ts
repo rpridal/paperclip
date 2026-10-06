@@ -164,7 +164,7 @@ import {
   toolProfiles,
   workspaceOperations,
 } from "@paperclipai/db";
-import { conflict, HttpError, notFound } from "../errors.js";
+import { badRequest, conflict, HttpError, notFound } from "../errors.js";
 import {
   getStartupTraceContext,
   getStartupTracer,
@@ -26345,6 +26345,39 @@ export function heartbeatService(
     }
   }
 
+  function pendingRecoveryReceiptId(agentId: string, companyId: string, opts: WakeupOptions) {
+    const context = opts.contextSnapshot ?? {};
+    if (context.source !== "issue.interaction.recovered" || opts.reason !== "interaction_pending") return null;
+    const issueId = readNonEmptyString(context.issueId);
+    const interactionId = readNonEmptyString(context.interactionId);
+    if (!issueId || !interactionId || !isUuidLike(issueId) || !isUuidLike(interactionId) ||
+      opts.payload?.issueId !== issueId || opts.payload?.interactionId !== interactionId ||
+      (opts.source ?? "on_demand") !== "on_demand" || opts.triggerDetail !== "manual" ||
+      !opts.requestedByActorId || !opts.requestedByActorType) {
+      throw badRequest("Invalid pending interaction recovery binding");
+    }
+    const digest = createHash("sha256").update(JSON.stringify([
+      "pending-interaction-recovery-v1", companyId, agentId, issueId, interactionId,
+      opts.requestedByActorType, opts.requestedByActorId, opts.idempotencyKey ?? "default",
+    ])).digest("hex");
+    return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+  }
+
+  async function readPendingRecoveryReceipt(queryDb: Db, agentId: string, opts: WakeupOptions) {
+    if (opts.contextSnapshot?.source !== "issue.interaction.recovered") return null;
+    const agent = await getAgent(agentId);
+    if (!agent) return null;
+    const receiptId = pendingRecoveryReceiptId(agentId, agent.companyId, opts);
+    if (!receiptId) return null;
+    const [receipt] = await queryDb.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receiptId));
+    if (receipt && (receipt.companyId !== agent.companyId || receipt.agentId !== agentId ||
+      receipt.payload?.issueId !== opts.payload?.issueId || receipt.payload?.interactionId !== opts.payload?.interactionId ||
+      receipt.requestedByActorType !== opts.requestedByActorType || receipt.requestedByActorId !== opts.requestedByActorId)) {
+      throw conflict("Pending interaction recovery receipt binding changed");
+    }
+    return receipt ?? null;
+  }
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -26467,10 +26500,12 @@ export function heartbeatService(
     if (durableRequest?.failedRunRetry) {
       opts = { ...opts, allowRunCoalescing: false };
     }
+    const pendingReceiptId = pendingRecoveryReceiptId(agentId, agent.companyId, opts);
     const durableReceiptFields = durableRequest
       ? { id: durableRequest.id, requestedAt: durableRequest.requestedAt }
-      : {};
+      : pendingReceiptId ? { id: pendingReceiptId, requestedAt: new Date() } : {};
     const existingDurableReceipt = async (queryDb: Db) => {
+      if (pendingReceiptId) return readPendingRecoveryReceipt(queryDb, agentId, opts);
       if (!durableRequest) return null;
       const receipt = await queryDb
         .select()
@@ -27894,10 +27929,10 @@ export function heartbeatService(
                   wakeupRequestId: activeExecutionRun.wakeupRequestId,
                 },
                 allowRunCoalescing: isConversation(issue) ? false : opts.allowRunCoalescing,
-                durableReceipt: durableRequest
+                durableReceipt: durableRequest || pendingReceiptId
                   ? {
-                      id: durableRequest.id,
-                      requestedAt: durableRequest.requestedAt,
+                      id: durableRequest?.id ?? pendingReceiptId!,
+                      requestedAt: durableRequest?.requestedAt ?? durableReceiptFields.requestedAt!,
                     }
                   : undefined,
                 reason,

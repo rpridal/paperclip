@@ -763,6 +763,26 @@ pre-dispatch validation do not transfer ownership or create a participant grant.
 Generic review reasons do not establish this scope. Dependency and subtree
 holds remain enforced.
 
+An authorized wake operator may recover an existing pending addressed confirmation
+with `POST /api/agents/:agentId/wakeup` and
+`pendingInteraction: { issueId, interactionId }`. The server checks ordinary
+agent-wake and issue-comment access, then reads the current interaction under
+locks to verify its company, issue, addressee, resolver audience and current
+document target. Only the bounded participant path is recoverable. The server
+constructs the scoped payload and context with provenance
+`issue.interaction.recovered`; the caller supplies neither authority markers nor
+creator-run attribution. Recovery uses on-demand/manual dispatch and rejects
+payload, alternate reasons/sources/triggers, failed-run retries, fresh-session
+overrides and debug capture. Recovery reserves a deterministic durable receipt
+identity bound to company, agent, issue, interaction, actual caller and attempt
+key (or the default attempt). Equivalent retries reuse that receipt, including
+deferred and terminal run outcomes. An explicit different attempt key requests
+new work. Receipt uniqueness and the issue admission lock prevent concurrent
+duplicate insertion; replay is not fresh dispatch authority.
+The legacy heartbeat-invoke endpoint rejects this selector. Recovery does not
+modify interaction history, ownership, checkout or execution stages; queued and
+final pre-dispatch guards still independently revalidate live eligibility.
+
 The agent first calls `POST /api/issues/:issueId/interactions/:interactionId/participate`
 with an empty object. This is a stateless preflight, not a participant grant or
 lease. The server requires a live run for that agent, company, and issue; an

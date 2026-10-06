@@ -257,6 +257,16 @@ describe("openapi routes", () => {
     expect(wake.responses["409"]).toBeDefined();
     expect(wake.description).toContain("durable queued/deferred receipt");
   });
+  it("documents the strict existing pending interaction recovery selector", async () => {
+    const res = await request(createApp()).get("/api/openapi.json");
+    const wake = res.body.paths["/api/agents/{id}/wakeup"].post;
+    expect(wake.requestBody.content["application/json"].schema.properties.pendingInteraction).toMatchObject({
+      type: "object", additionalProperties: false, required: ["issueId", "interactionId"],
+      properties: { issueId: { type: "string", format: "uuid" }, interactionId: { type: "string", format: "uuid" } },
+    });
+    expect(wake.description).toContain("pendingInteraction");
+  });
+
   it("serves the generated OpenAPI document", async () => {
     const res = await request(createApp()).get("/api/openapi.json");
 
