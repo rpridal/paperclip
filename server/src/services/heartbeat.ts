@@ -27205,6 +27205,13 @@ export function heartbeatService(
           // below, on the path that actually creates this wake's run.
           let strandedNoReplayHoldReleasable = false;
           const canReleaseStrandedNoReplayHold = async () => {
+            // Generic assignment recovery must never override a refused explicit
+            // continuation. Those requests retain their author, stop/cleanup and
+            // fresh-session contract even when the action is already settled.
+            if (opts.requestedByActorType === "user" || durableRequest || wakeCommentId ||
+                opts.queuedCommentInterruptId || opts.queuedCommentRequestId ||
+                reason === "retry_failed_run" || reason === "issue_commented" ||
+                reason === "issue_reopened_via_comment") return false;
             // Only a plainly re-runnable issue may lose the hold: an open task
             // with a single invokable agent owner and no human owner. An active
             // or escalated action, a conversation owner, or an unsafe workspace

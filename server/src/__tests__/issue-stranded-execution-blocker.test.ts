@@ -228,6 +228,21 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
     expect(await executionWaits(seed.agentId)).toHaveLength(0);
   });
 
+  it.each(["user", "system"] as const)("never releases a settled hold for an unadmitted comment wake (%s)", async actorType => {
+    const seed = await seedBlockedIssue({ issueStatus: "blocked", replay: "blocked" });
+    const wake = await heartbeatService(db).wakeup(seed.agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_commented",
+      requestedByActorType: actorType, requestedByActorId: "blocker-owner",
+      payload: { issueId: seed.issueId, commentId: randomUUID() },
+      contextSnapshot: { issueId: seed.issueId },
+    });
+    expect(wake).toBeNull();
+    expect(await runsForIssue(seed.issueId)).toHaveLength(0);
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, seed.actionId));
+    expect(action!.evidence.settledNoReplayHoldReleasedAt).toBeUndefined();
+    expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).not.toBeNull();
+  });
+
   it("T2: an open recovery action still parks the wake", async () => {
     const seed = await seedBlockedIssue({ issueStatus: "todo", recoveryStatus: "active", replay: "blocked" });
     expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).not.toBeNull();
