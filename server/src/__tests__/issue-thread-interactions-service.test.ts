@@ -171,6 +171,39 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       return { issue, actor, interaction, creatorId, executionState };
     }
 
+    it("prepares pending recovery without modifying ownership or interaction history", async () => {
+      const { issue, actor, interaction } = await seedParticipant();
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, actor.runId));
+      const [beforeIssue] = await db.select().from(issues).where(eq(issues.id, issue.id));
+      const beforeInteraction = await interactionsSvc.getForIssue(issue, interaction.id);
+      const prepared = await interactionsSvc.preparePendingConfirmationWake({ companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId, interactionId: interaction.id });
+      expect(prepared).toEqual({
+        payload: { issueId: issue.id, interactionId: interaction.id, interactionKind: "request_confirmation", mutation: "interaction" },
+        contextSnapshot: { issueId: issue.id, taskId: issue.id, interactionId: interaction.id, interactionKind: "request_confirmation", wakeReason: "interaction_pending", source: "issue.interaction.recovered" },
+      });
+      const [afterIssue] = await db.select().from(issues).where(eq(issues.id, issue.id));
+      expect(afterIssue).toEqual(beforeIssue);
+      expect(await interactionsSvc.getForIssue(issue, interaction.id)).toEqual(beforeInteraction);
+    });
+
+    it("denies pending recovery for another company, issue, agent or creator", async () => {
+      const { issue, actor, interaction, creatorId } = await seedParticipant();
+      const selection = { companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId, interactionId: interaction.id };
+      for (const override of [{ companyId: randomUUID() }, { issueId: randomUUID() }, { interactionId: randomUUID() }]) {
+        await expect(interactionsSvc.preparePendingConfirmationWake({ ...selection, ...override })).rejects.toMatchObject({ status: 404 });
+      }
+      for (const agentId of [creatorId, randomUUID()]) {
+        await expect(interactionsSvc.preparePendingConfirmationWake({ ...selection, agentId })).rejects.toMatchObject({ status: 403 });
+      }
+      expect((await interactionsSvc.getForIssue(issue, interaction.id)).status).toBe("pending");
+    });
+
+    it.each(["expired", "accepted", "rejected", "cancelled"])("denies pending recovery of %s confirmations", async (status) => {
+      const { issue, actor, interaction } = await seedParticipant();
+      await db.update(issueThreadInteractions).set({ status }).where(eq(issueThreadInteractions.id, interaction.id));
+      await expect(interactionsSvc.preparePendingConfirmationWake({ companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId, interactionId: interaction.id })).rejects.toMatchObject({ status: 409 });
+    });
+
     it("preflights and accepts the addressed request without changing assignee, lease or stages", async () => {
       const { issue, actor, interaction, creatorId, executionState } = await seedParticipant();
       await expect(issuesSvc.checkout(issue.id, actor.agentId, ["in_review"], actor.runId)).rejects.toMatchObject({ status: 409 });
@@ -253,6 +286,31 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       await db.update(issueThreadInteractions).set({ payload: { ...interaction.payload, target: { ...target, key: "review-evidence" } } }).where(eq(issueThreadInteractions.id, interaction.id));
       await db.update(documents).set({ latestRevisionId: randomUUID() }).where(eq(documents.id, target.documentId));
       await expect(interactionsSvc.participate(issue, interaction.id, actor)).rejects.toMatchObject({ status: 422 });
+      await expect(interactionsSvc.preparePendingConfirmationWake({ companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId, interactionId: interaction.id })).rejects.toMatchObject({ status: 422 });
+    });
+
+    it.each(["done", "cancelled"])("denies recovery on a %s issue", async (status) => {
+      const { issue, actor, interaction } = await seedParticipant();
+      await db.update(issues).set({ status }).where(eq(issues.id, issue.id));
+      await expect(interactionsSvc.preparePendingConfirmationWake({ companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId, interactionId: interaction.id })).rejects.toMatchObject({ status: 409 });
+      expect((await interactionsSvc.getForIssue(issue, interaction.id)).status).toBe("pending");
+    });
+
+    it.each([
+      { toolAction: {} }, { secretProposal: {} },
+      { target: { type: "issue_document", key: "plan" } },
+    ])("denies pending recovery for governed payload %j", async (override) => {
+      const { issue, actor, interaction } = await seedParticipant();
+      await db.update(issueThreadInteractions).set({ payload: { ...interaction.payload, ...override } }).where(eq(issueThreadInteractions.id, interaction.id));
+      await expect(interactionsSvc.preparePendingConfirmationWake({ companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId, interactionId: interaction.id })).rejects.toMatchObject({ status: 403 });
+    });
+
+    it("does not recover human-only or creator-excluded confirmation work", async () => {
+      const { issue, actor, interaction, creatorId } = await seedParticipant();
+      await db.update(issueThreadInteractions).set({ effectiveResolverPolicy: "human_only" }).where(eq(issueThreadInteractions.id, interaction.id));
+      await expect(interactionsSvc.preparePendingConfirmationWake({ companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId, interactionId: interaction.id })).rejects.toMatchObject({ status: 403 });
+      await db.update(issueThreadInteractions).set({ effectiveResolverPolicy: "not_creator", addresseeAgentId: creatorId }).where(eq(issueThreadInteractions.id, interaction.id));
+      await expect(interactionsSvc.preparePendingConfirmationWake({ companyId: issue.companyId, issueId: issue.id, agentId: creatorId, interactionId: interaction.id })).rejects.toMatchObject({ status: 403 });
     });
 
     it.each([

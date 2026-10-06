@@ -24,6 +24,10 @@ const mockIssueService = vi.hoisted(() => ({
   getByIdentifier: vi.fn(),
 }));
 
+const mockInteractionService = vi.hoisted(() => ({
+  preparePendingConfirmationWake: vi.fn(),
+}));
+
 const mockExecutionProjection = vi.hoisted(() => ({
   executionProjectionForRun: vi.fn(async () => null),
   executionProjectionsForRuns: vi.fn(async () => new Map()),
@@ -79,6 +83,9 @@ const mockChatRunRetries = vi.hoisted(() => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/issue-thread-interactions.js", () => ({
+    issueThreadInteractionService: () => mockInteractionService,
+  }));
   vi.doMock("../services/execution-projection.js", () => mockExecutionProjection);
   vi.doMock("../routes/authz.js", async () =>
     vi.importActual("../routes/authz.js"),
@@ -303,6 +310,7 @@ describe("agent live run routes", () => {
       status: "in_progress",
     });
     mockIssueService.getById.mockResolvedValue(null);
+    mockInteractionService.preparePendingConfirmationWake.mockReset();
     mockAgentService.getById.mockResolvedValue({
       id: "agent-1",
       companyId: "company-1",
@@ -964,6 +972,64 @@ describe("agent live run routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(202);
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "agent:wake" }));
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, expect.objectContaining({ manualUserWake: true }));
+  });
+
+  describe("pending addressed review recovery", () => {
+    const selection = { issueId: failedChatIssueId, interactionId: retryActionId };
+    const canonical = {
+      payload: { issueId: failedChatIssueId, interactionId: retryActionId, interactionKind: "request_confirmation", mutation: "interaction" },
+      contextSnapshot: { issueId: failedChatIssueId, taskId: failedChatIssueId, interactionId: retryActionId, interactionKind: "request_confirmation", wakeReason: "interaction_pending", source: "issue.interaction.recovered" },
+    };
+
+    it("requires issue access in addition to agent wake access", async () => {
+      mockIssueService.getById.mockResolvedValue({ id: failedChatIssueId, companyId: "company-1", status: "in_review", assigneeAgentId: "developer" });
+      mockAccessService.decide.mockImplementation(async ({ action }) => ({ allowed: action === "agent:wake", explanation: "Issue access denied" }));
+      const res = await requestApp(await createApp(undefined, {
+        type: "board", userId: "operator", source: "session", companyIds: ["company-1"],
+      }), url => request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({ pendingInteraction: selection }));
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      expect(mockInteractionService.preparePendingConfirmationWake).not.toHaveBeenCalled();
+    });
+
+    it("rejects the selector on legacy invoke instead of silently losing scope", async () => {
+      const res = await requestApp(await createApp(), url => request(url).post(`/api/agents/${routeAgentId}/heartbeat/invoke`).send({ pendingInteraction: selection }));
+      expect(res.status).toBe(400);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("constructs scoped recovery from the selected existing interaction without caller authority", async () => {
+      mockAgentService.getById.mockResolvedValue({ id: routeAgentId, companyId: "company-1" });
+      mockIssueService.getById.mockResolvedValue({ id: failedChatIssueId, companyId: "company-1", status: "in_review", assigneeAgentId: "developer" });
+      mockInteractionService.preparePendingConfirmationWake.mockResolvedValue(canonical);
+      const res = await requestApp(await createApp(undefined, {
+        type: "board", userId: "operator", source: "session", companyIds: ["company-1"],
+      }), url => request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({
+        pendingInteraction: selection, idempotencyKey: "recover-existing-review",
+      }));
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockInteractionService.preparePendingConfirmationWake).toHaveBeenCalledWith({ companyId: "company-1", agentId: routeAgentId, ...selection });
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:comment", resource: expect.objectContaining({ issueId: failedChatIssueId }) }));
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, expect.objectContaining({
+        source: "on_demand", triggerDetail: "manual", reason: "interaction_pending", payload: canonical.payload,
+        idempotencyKey: "recover-existing-review", requestedByActorType: "user", requestedByActorId: "operator",
+        contextSnapshot: expect.objectContaining(canonical.contextSnapshot),
+      }));
+    });
+
+    it.each([
+      { payload: { interactionKind: "request_confirmation", sourceRunId: failedChatRunId } },
+      { reason: "issue_commented" }, { source: "automation" }, { triggerDetail: "system" },
+      { forceFreshSession: true }, { failedRunId: failedChatRunId },
+      { debug: { providerTrace: "raw" } },
+    ])("rejects recovery execution overrides %j before enqueue", async override => {
+      const res = await requestApp(await createApp(undefined, {
+        type: "board", userId: "operator", source: "session", companyIds: ["company-1"],
+      }), url => request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({ pendingInteraction: selection, ...override }));
+      expect(res.status).toBe(400);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      expect(mockInteractionService.preparePendingConfirmationWake).not.toHaveBeenCalled();
+    });
   });
 
   describe("exact failed chat run retry", () => {

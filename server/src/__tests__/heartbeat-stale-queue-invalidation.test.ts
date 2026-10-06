@@ -813,9 +813,58 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     },
   );
 
-  it.each(["unchanged", "resolved", "unaddressed", "closed", "stale target", "active owner", "duplicate reviewer"])(
-    "revalidates addressed confirmation %s at the provider boundary without taking ownership",
-    async (mutation) => {
+  it("replays one pending recovery receipt across concurrent and ended-run retries", async () => {
+    const { companyId, agentId: reviewerId } = await seedCompanyAndAgent();
+    const ownerId = randomUUID();
+    await db.insert(agents).values({ id: ownerId, companyId, name: "RecoveryOwner", role: "engineer", status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    const issueId = randomUUID();
+    const interactionId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Pending recovery retry", status: "in_review", priority: "medium", assigneeAgentId: ownerId });
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId, companyId, issueId, kind: "request_confirmation", status: "pending",
+      createdByAgentId: ownerId, addresseeAgentId: reviewerId, requestedResolverPolicy: "not_creator",
+      effectiveResolverPolicy: "not_creator", resolverPolicyProvenance: "explicit", effectiveResolverPolicySource: "requested",
+      payload: { version: 1, prompt: "Review current evidence" },
+    });
+    let releaseDispatch!: () => void;
+    const dispatchGate = new Promise<void>((resolve) => { releaseDispatch = resolve; });
+    beforeContinuationDispatchCheck = async () => { await dispatchGate; };
+    const options = {
+      source: "on_demand" as const, triggerDetail: "manual" as const, reason: "interaction_pending",
+      manualUserWake: true, requestedByActorType: "user" as const, requestedByActorId: "responsible-user",
+      idempotencyKey: "same-recovery-attempt",
+      payload: { issueId, interactionId, interactionKind: "request_confirmation", mutation: "interaction" },
+      contextSnapshot: { issueId, taskId: issueId, interactionId, interactionKind: "request_confirmation", wakeReason: "interaction_pending", source: "issue.interaction.recovered" },
+    };
+    try {
+      const receipts = await Promise.all([heartbeat.wakeup(reviewerId, options), heartbeat.wakeup(reviewerId, options)]);
+      expect(receipts[0]?.id).toBeTruthy();
+      expect(receipts[1]?.id).toBe(receipts[0]?.id);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(1);
+      const deferredOptions = { ...options, idempotencyKey: "explicit-next-recovery-attempt" };
+      expect(await heartbeat.wakeup(reviewerId, deferredOptions)).toBeNull();
+      const deferredReceipts = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      expect(deferredReceipts).toHaveLength(2);
+      expect(deferredReceipts.filter((receipt) => receipt.status === "deferred_issue_execution")).toHaveLength(1);
+      expect(await heartbeat.wakeup(reviewerId, deferredOptions)).toBeNull();
+      expect(await heartbeat.wakeup(reviewerId, deferredOptions)).toBeNull();
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(2);
+      releaseDispatch();
+      expect(await waitForCondition(async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, receipts[0]!.id)))[0]?.status === "succeeded")).toBe(true);
+      const replay = await heartbeat.wakeup(reviewerId, options);
+      expect(replay?.id).toBe(receipts[0]?.id);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(2);
+      expect(countExecuteCallsForRun(receipts[0]!.id)).toBe(1);
+    } finally {
+      releaseDispatch();
+    }
+  });
+
+  it.each(["issue.interaction.created", "issue.interaction.recovered"].flatMap((source) =>
+    ["unchanged", "resolved", "unaddressed", "closed", "stale target", "active owner", "duplicate reviewer"].map((mutation) => ({ source, mutation })),
+  ))(
+    "revalidates addressed confirmation $mutation ($source) at the provider boundary without taking ownership",
+    async ({ source, mutation }) => {
       const { companyId, agentId: reviewerId } = await seedCompanyAndAgent();
       const ownerId = randomUUID();
       await db.insert(agents).values({
@@ -843,7 +892,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       });
       const { runId } = await seedQueuedRun({
         companyId, agentId: reviewerId, issueId, wakeReason: "interaction_pending",
-        contextExtras: { interactionId, interactionKind: "request_confirmation", source: "issue.interaction.created" },
+        contextExtras: { interactionId, interactionKind: "request_confirmation", source },
       });
       let boundaryReached = false;
       let conflictRunId: string | null = null;

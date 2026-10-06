@@ -113,6 +113,7 @@ import {
 import {
   assertIssueThreadInteractionResolverAudience,
   canonicalizeStoredResolverPolicy,
+  issueThreadInteractionAttentionAgentAllowed,
   issueThreadInteractionResolutionError,
   type IssueThreadInteractionResolverRestriction,
 } from "./issue-thread-interaction-resolution.js";
@@ -2708,6 +2709,44 @@ export function issueThreadInteractionService(
 
   return {
     getForIssue,
+    preparePendingConfirmationWake: async (selection: {
+      companyId: string;
+      issueId: string;
+      interactionId: string;
+      agentId: string;
+    }) => db.transaction(async (tx) => {
+      const [currentIssue] = await tx.select().from(issues).where(and(
+        eq(issues.id, selection.issueId),
+        eq(issues.companyId, selection.companyId),
+      )).for("update");
+      if (!currentIssue) throw notFound("Issue not found");
+      const [interaction] = await tx.select().from(issueThreadInteractions).where(and(
+        eq(issueThreadInteractions.id, selection.interactionId),
+        eq(issueThreadInteractions.issueId, selection.issueId),
+        eq(issueThreadInteractions.companyId, selection.companyId),
+      )).for("update");
+      if (!interaction) throw notFound("Interaction not found");
+      if (interaction.status !== "pending" || isTerminalIssueStatus(currentIssue.status)) {
+        throw conflict("Interaction is no longer actionable");
+      }
+      const actor = { agentId: selection.agentId };
+      if (!issueThreadInteractionAttentionAgentAllowed({ agentId: selection.agentId, interaction }) ||
+        !isScopedInteractionParticipant(currentIssue, interaction, actor) ||
+        await isActiveIssueReviewVerdict(tx as unknown as Db, currentIssue, interaction)) {
+        throw forbidden("Only an addressed confirmation participant can recover this interaction");
+      }
+      await assertRequestConfirmationTargetIsCurrent(tx, {
+        companyId: selection.companyId,
+        issueId: selection.issueId,
+        target: (interaction.payload as RequestConfirmationInteraction["payload"]).target,
+        lockForUpdate: true,
+      });
+      const scope = { issueId: currentIssue.id, interactionId: interaction.id, interactionKind: interaction.kind };
+      return {
+        payload: { ...scope, mutation: "interaction" },
+        contextSnapshot: { ...scope, taskId: currentIssue.id, wakeReason: "interaction_pending", source: "issue.interaction.recovered" },
+      };
+    }),
     participate: async (
       issue: { id: string; companyId: string },
       interactionId: string,
