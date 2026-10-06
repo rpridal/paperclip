@@ -110,7 +110,6 @@ import { authorizationDeniedDetails } from "../services/authorization.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import {
   getLegacyToolApproval,
-  resolveLegacyToolApproval,
   clearLegacyToolApprovalsForRun,
 } from "../services/legacy-tool-approval-registry.js";
 import {
@@ -6817,7 +6816,12 @@ export function agentRoutes(
     // Recovery reads this to stand down instead of classifying the cancelled
     // run as agent stranding and re-waking the agent the operator just stopped.
     // Synchronous consent fence before cancellation yields to provider/DB I/O.
-    clearLegacyToolApprovalsForRun(runId);
+    // Observe rejection immediately, but never wait for storage before stopping
+    // the provider. An audit failure is explicit only AFTER cancellation.
+    const withdrawalAudit = clearLegacyToolApprovalsForRun(runId).then(
+      () => null,
+      () => new Error("legacy_consent_withdrawal_audit_failed_no_delivery"),
+    );
     const run = await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
       resultJson: {
         cancelledByActorType: "user",
@@ -6826,7 +6830,7 @@ export function agentRoutes(
     });
 
     if (run) {
-      clearLegacyToolApprovalsForRun(run.id);
+      await clearLegacyToolApprovalsForRun(run.id);
       await logActivity(db, {
         companyId: run.companyId,
         actorType: "user",
@@ -6838,6 +6842,8 @@ export function agentRoutes(
       });
     }
 
+    const withdrawalError = await withdrawalAudit;
+    if (withdrawalError) throw withdrawalError;
     res.json(run);
   });
 
@@ -7049,6 +7055,14 @@ export function agentRoutes(
     },
   );
 
+  router.get("/heartbeat-runs/:runId/legacy-tool-approvals/:requestId", (_req, _res) => {
+    // Prompt read requires the same missing designated authority as consumption.
+    // Do not expose a command through ambient board/run visibility.
+    throw forbidden("No supported designated legacy consent resolver authority is available.", {
+      code: "legacy_consent_resolver_contract_unavailable",
+    });
+  });
+
   router.post("/heartbeat-runs/:runId/legacy-tool-approvals/:requestId/resolve", async (req, res) => {
     assertBoard(req);
     assertInstanceAdmin(req);
@@ -7061,26 +7075,23 @@ export function agentRoutes(
     if (!existing) return;
     if (existing.status !== "running" ||
         parseObject(parseObject(existing.resultJson).executionCancellation).state === "requested") {
-      clearLegacyToolApprovalsForRun(runId);
+      await clearLegacyToolApprovalsForRun(runId);
       throw conflict("This run is no longer accepting tool approval responses.");
     }
     const pending = getLegacyToolApproval({ runId, requestId });
     if (!pending || pending.companyId !== existing.companyId || pending.agentId !== existing.agentId) {
       throw conflict("This tool approval is stale or is no longer pending.");
     }
-    // The registry consumes before provider I/O, so an ambiguous delivery cannot be replayed.
-    const resolved = await resolveLegacyToolApproval({ runId, requestId, choice });
-    if (!resolved) throw conflict("This tool approval is stale or is no longer pending.");
-    await logActivity(db, {
-      companyId: existing.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "local-admin",
-      action: "heartbeat.legacy_tool_approval_resolved",
-      entityType: "heartbeat_run",
-      entityId: existing.id,
-      details: { requestId, provider: pending.provider, providerRunId: pending.providerRunId, choice },
+    // Neither board restoration nor implicit/instance admin is a designated
+    // run/request-bound consent grant. The existing native resolver contract
+    // supports human_only/instance_admin only, and company permission grants
+    // expose no legacy consent resource/action. Do not synthesize an agent
+    // designation from caller input, org role, or a provider event. Until the
+    // runtime owner supplies a supported server-trusted contract, fail closed
+    // before consuming this request or invoking its credential-bearing closure.
+    throw forbidden("No supported designated legacy consent resolver authority is available.", {
+      code: "legacy_consent_resolver_contract_unavailable",
     });
-    res.status(202).json({ accepted: true, requestId, choice });
   });
 
   router.post("/heartbeat-runs/:runId/watchdog-decisions", async (req, res) => {

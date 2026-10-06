@@ -62,7 +62,7 @@ describe('legacy approval disposable HTTP transport', () => {
       onLog: async (_stream, text) => { logs.push(text); },
       onLegacyToolApproval: async pending => {
         registrations++;
-        registerLegacyToolApproval({ runId, companyId: ctx.agent.companyId, agentId: ctx.agent.id, approval: pending });
+        registerLegacyToolApproval({ runId, companyId: ctx.agent.companyId, agentId: ctx.agent.id, approval: pending, audit: async () => {} }); // storage fixture only; durable failure coverage is audit-http
       },
     };
     let execution: ReturnType<typeof execute> | undefined;

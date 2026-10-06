@@ -54,6 +54,7 @@ type ExecutionState = {
   lastEventName: string | null;
   /** Never re-register a consent after an SSE reconnect or status poll. */
   reportedApprovalRequestIds: Set<string>;
+  consentDeadlineAt?: number;
   /** Shared publication fence for in-flight SSE and polling callbacks. */
   lifecycleClosed: boolean;
   terminal: TerminalState | null;
@@ -490,7 +491,7 @@ function extractOutput(value: unknown): string | null {
 }
 
 function approvalRequestId(eventName: string | null, value: Record<string, unknown> | null, providerRunId: string): string | null {
-  const approval = eventName === "approval.request" ? value : asRecord(value?.approval);
+  const approval = asRecord(value?.approval) ?? (eventName === "approval.request" ? value : null);
   if (!approval) return null;
   // An explicit mismatch in either polling envelope or SSE payload rejects
   // the request. Missing nested run ID is compatible only with an exact outer ID.
@@ -509,6 +510,7 @@ async function reportLegacyApproval(
   eventName: string | null,
   record: Record<string, unknown> | null,
   resolve: (requestId: string, choice: "once" | "deny") => Promise<void>,
+  redactText: TextRedactor = sanitizeSensitiveText,
 ): Promise<void> {
   const requestId = approvalRequestId(eventName, record, state.runId);
   if (state.lifecycleClosed || state.terminal || ctx.signal?.aborted) return;
@@ -517,7 +519,21 @@ async function reportLegacyApproval(
   if (!ctx.onLegacyToolApproval) return;
   // No await between this lifecycle check and callback publication.
   if (state.lifecycleClosed || state.terminal || ctx.signal?.aborted) return;
+  const source = asRecord(record?.approval) ?? (eventName === "approval.request" ? record : null);
+  // The actual Hermes envelope copies approval_data. command/description are
+  // the established fields; preserve explicit typed fields only when supplied.
+  // No invented turn identity, inferred tool, or default risk classification.
+  const text = (value: unknown): string | undefined => typeof value === "string" ? redactText(value) : undefined;
+  const prompt = Object.freeze({
+    ...(typeof source?.tool === "string" ? { tool: text(source.tool) } : {}),
+    ...(typeof (source?.action ?? source?.command) === "string" ? { action: text(source?.action ?? source?.command) } : {}),
+    ...(typeof (source?.reason ?? source?.description) === "string" ? { reason: text(source?.reason ?? source?.description) } : {}),
+    ...(typeof source?.risk === "string" ? { risk: text(source.risk) } : {}),
+  });
   await ctx.onLegacyToolApproval({
+    prompt,
+    expiresAt: state.consentDeadlineAt,
+    isClosed: () => state.lifecycleClosed || Boolean(state.terminal) || Boolean(ctx.signal?.aborted),
     provider: "hermes_gateway",
     providerRunId: state.runId,
     requestId,
@@ -557,7 +573,7 @@ async function handleEvent(
   );
   if ((state.lifecycleClosed && !isTerminal) || ctx.signal?.aborted) return;
   if (resolveLegacyApproval) {
-    await reportLegacyApproval(ctx, state, eventName, record, resolveLegacyApproval);
+    await reportLegacyApproval(ctx, state, eventName, record, resolveLegacyApproval, redactText);
   }
   if (eventName && eventName !== "approval.request") {
     await ctx.onEvent?.({
@@ -631,6 +647,7 @@ async function pollStatus(input: {
         nonEmpty(record?.last_event) ?? null,
         record,
         input.resolveLegacyApproval ?? (async () => undefined),
+        input.redactText,
       );
     } catch (err) {
       if (input.signal.aborted) return;
@@ -1016,6 +1033,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   const controller = new AbortController();
   const state = createExecutionState(runId);
+  // Same local deadline as the existing run timeout; no provider timeout is
+  // fabricated. Terminal/cancel closes the predicate synchronously as before.
+  state.consentDeadlineAt = timeoutMs > 0 ? Date.now() + timeoutMs : undefined;
   const resolveLegacyApproval = async (requestId: string, choice: "once" | "deny") => {
     ctx.signal?.throwIfAborted();
     controller.signal.throwIfAborted();

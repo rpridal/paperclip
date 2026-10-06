@@ -23017,7 +23017,7 @@ export function heartbeatService(
           if (!activeRun) return;
           if (activeRun.status !== "running" ||
               parseObject(parseObject(activeRun.resultJson).executionCancellation).state === "requested") {
-            clearLegacyToolApprovalsForRun(currentRun.id);
+            await clearLegacyToolApprovalsForRun(currentRun.id);
             return;
           }
           // Persist only public, typed identifiers; the adapter retains its bearer credential
@@ -23027,13 +23027,31 @@ export function heartbeatService(
             companyId: currentRun.companyId,
             agentId: currentRun.agentId,
             approval,
+            beforeProvider: async () => {
+              const latest = await getRun(currentRun.id);
+              return !latest || latest.status !== "running" ||
+                parseObject(parseObject(latest.resultJson).executionCancellation).state === "requested"
+                ? "cancel" : null;
+            },
+            audit: async event => {
+              // Await durable activity insertion, not best-effort run-log/live
+              // publication. Prompt/command/credential never enter this audit.
+              await logActivity(db, {
+                companyId: currentRun.companyId,
+                actorType: "system", actorId: "legacy-consent-bridge",
+                action: `legacy.tool_approval.${event.phase}`,
+                entityType: "heartbeat_run", entityId: currentRun.id,
+                runId: currentRun.id, agentId: currentRun.agentId,
+                details: { ...event },
+              });
+            },
           });
           if (!registered) return;
           await appendRunEvent(currentRun, {
             eventType: "legacy.tool_approval.requested",
             stream: "system",
             level: "warn",
-            message: "A Hermes tool action is waiting for instance-admin approval.",
+            message: "A Hermes tool action is waiting for designated consent; resolver authority is unavailable.",
             payload: {
               provider: approval.provider,
               providerRunId: approval.providerRunId,
@@ -24457,7 +24475,7 @@ export function heartbeatService(
               );
             if (!guardedDispatch.dispatched) return;
             adapterResult = await guardedDispatch.resultPromise;
-            clearLegacyToolApprovalsForRun(run.id);
+            await clearLegacyToolApprovalsForRun(run.id);
           }
           adapterResult = applyWorkspaceRestoreFailure(adapterResult);
           // A returned result can include a failed restore. Keep the workspace
@@ -24503,7 +24521,7 @@ export function heartbeatService(
             }
           }
         } catch (adapterErr) {
-          clearLegacyToolApprovalsForRun(run.id);
+          await clearLegacyToolApprovalsForRun(run.id);
           if (adapterErr instanceof NativeControllerDetachedForRestartError) {
             // Preserve the provider and its run for the new controller. This
             // also keeps generic teardown from terminalizing/releasing its lease.
@@ -28856,7 +28874,11 @@ export function heartbeatService(
   ) {
     // Internal callers also revoke consent synchronously, even if lookup or
     // termination fails. Only this immutable run identity is fenced.
-    clearLegacyToolApprovalsForRun(runId);
+    // Audit failure cannot prevent provider cancellation. Report only a fixed
+    // code, never a storage error that could echo a credential/command.
+    void clearLegacyToolApprovalsForRun(runId).catch(() => {
+      logger.error({ runId, code: "legacy_consent_withdrawal_audit_failed_no_delivery" }, "legacy consent withdrawal audit failed; cancellation continues");
+    });
     let run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     const pendingNativeRetry =
