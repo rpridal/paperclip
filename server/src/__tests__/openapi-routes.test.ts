@@ -226,6 +226,37 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents legacy consent as fail-closed, not a working approval bridge", () => {
+    const { spec } = loadSpecRoutes();
+    const read = spec.paths["/api/heartbeat-runs/{runId}/legacy-tool-approvals/{requestId}"]?.get;
+    const resolve = spec.paths["/api/heartbeat-runs/{runId}/legacy-tool-approvals/{requestId}/resolve"]?.post;
+    expect(read).toBeDefined();
+    expect(resolve).toBeDefined();
+    expect(read.security).toEqual([]);
+    expect(read["x-paperclip-authorization"]).toEqual({ actor: "public" });
+    expect(read.description).toContain("always returns 403");
+    expect(Object.keys(read.responses)).toEqual(["403"]);
+    expect(read.parameters.map((parameter: any) => parameter.schema)).toEqual([
+      { type: "string" }, { type: "string" },
+    ]);
+    expect(resolve.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+    expect(resolve["x-paperclip-authorization"]).toEqual({ actor: "board", instanceAdmin: true });
+    expect(resolve.description).toContain("local_implicit");
+    expect(resolve.description).toContain("does not consume");
+    expect(resolve.requestBody.required).toBe(true);
+    expect(resolve.requestBody.content["application/json"].schema).toMatchObject({
+      type: "object", required: ["choice"], additionalProperties: true,
+      properties: { choice: { type: "string", enum: ["once", "deny"] } },
+    });
+    expect(resolve.parameters[0].schema.pattern).toBeDefined();
+    expect(resolve.parameters[1].schema).toMatchObject({ minLength: 1, maxLength: 256 });
+    expect(Object.keys(resolve.responses).sort()).toEqual(["400", "403", "404", "409", "500"]);
+    const unavailable = read.responses["403"].content["application/json"].schema;
+    expect(unavailable.required).toEqual(["error", "code", "details"]);
+    expect(unavailable.properties.code.enum).toEqual(["legacy_consent_resolver_contract_unavailable"]);
+    expect(unavailable.properties.details.properties.code.enum).toEqual(unavailable.properties.code.enum);
+    expect(resolve.responses["403"].content["application/json"].schema.anyOf).toContainEqual(unavailable);
+  });
   it("documents personal board-only announcements and private responses", () => {
     const { spec } = loadSpecRoutes();
     const current = spec.paths["/api/announcements/current"].get;
@@ -935,8 +966,15 @@ describe("heartbeat run ID OpenAPI contract", () => {
     let checked = 0;
     for (const [path, operations] of Object.entries(paths)) {
       if (!path.startsWith("/api/heartbeat-runs/{runId}") || path.endsWith("/issues")) continue;
-      for (const operation of Object.values(operations as Record<string, any>)) {
+      for (const [method, operation] of Object.entries(operations as Record<string, any>)) {
         const parameter = operation.parameters.find((param: { name: string }) => param.name === "runId");
+        // This one existing handler unconditionally denies before UUID validation.
+        // Keep it covered, but do not invent a reachable 400 or validated UUID.
+        if (method === "get" && path === "/api/heartbeat-runs/{runId}/legacy-tool-approvals/{requestId}") {
+          expect(parameter.schema).toEqual({ type: "string" });
+          expect(Object.keys(operation.responses)).toEqual(["403"]);
+          continue;
+        }
         expect(parameter.schema.pattern).toEqual(expect.any(String));
         const pattern = new RegExp(parameter.schema.pattern);
         for (const id of [
@@ -953,6 +991,6 @@ describe("heartbeat run ID OpenAPI contract", () => {
         checked++;
       }
     }
-    expect(checked).toBe(12);
+    expect(checked).toBe(13);
   });
 });
