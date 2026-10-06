@@ -139,6 +139,166 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     };
   }
 
+  describe("addressed reviewer participation without checkout", () => {
+    async function seedParticipant() {
+      const { companyId, issueId } = await seedConfirmationIssue();
+      const creatorId = randomUUID();
+      const reviewerId = randomUUID();
+      const runId = randomUUID();
+      const sourceRunId = randomUUID();
+      await db.insert(agents).values([creatorId, reviewerId].map((agentId) => ({
+        id: agentId, companyId, name: agentId, role: "engineer", status: "active",
+        adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      })));
+      await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId: creatorId, status: "succeeded" });
+      const executionState = {
+        status: "pending", currentStageId: randomUUID(), currentStageType: "delivery",
+        currentParticipant: { type: "agent", agentId: creatorId }, lastDecisionOutcome: "changes_requested",
+      };
+      await db.update(issues).set({ assigneeAgentId: creatorId, status: "in_review", executionState }).where(eq(issues.id, issueId));
+      const interaction = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation", title: "Publish the independent host review",
+        resolverPolicy: "not_creator", addresseeAgentId: reviewerId, sourceRunId,
+        continuationPolicy: "wake_assignee",
+        payload: { version: 1, prompt: "Publish only after exact-head verification", supersedeOnUserComment: false },
+      }, { agentId: creatorId });
+      await db.insert(heartbeatRuns).values({
+        id: runId, companyId, agentId: reviewerId, status: "running",
+        contextSnapshot: { issueId, interactionId: interaction.id },
+      });
+      const issue = { id: issueId, companyId };
+      const actor = { agentId: reviewerId, runId };
+      return { issue, actor, interaction, creatorId, executionState };
+    }
+
+    it("preflights and accepts the addressed request without changing assignee, lease or stages", async () => {
+      const { issue, actor, interaction, creatorId, executionState } = await seedParticipant();
+      await expect(issuesSvc.checkout(issue.id, actor.agentId, ["in_review"], actor.runId)).rejects.toMatchObject({ status: 409 });
+      const participation = await interactionsSvc.participate(issue, interaction.id, actor);
+      expect(participation).toMatchObject({ interactionId: interaction.id, runId: actor.runId, scope: "interaction", allowedActions: ["accept", "reject"] });
+      const result = await interactionsSvc.acceptInteraction(issue, interaction.id, {}, actor);
+      expect(result.interaction).toMatchObject({ status: "accepted", resolvedByAgentId: actor.agentId, resolvedByRunId: actor.runId });
+      const [after] = await db.select().from(issues).where(eq(issues.id, issue.id));
+      expect(after).toMatchObject({ assigneeAgentId: creatorId, status: "in_review", checkoutRunId: null, executionRunId: null, executionState });
+    });
+
+    it("denies other agents and the creator even with the reviewer's run id", async () => {
+      const { issue, actor, interaction, creatorId } = await seedParticipant();
+      await expect(interactionsSvc.participate(issue, interaction.id, { ...actor, agentId: creatorId })).rejects.toMatchObject({ status: 403 });
+      await expect(interactionsSvc.participate(issue, interaction.id, { ...actor, agentId: randomUUID() })).rejects.toMatchObject({ status: 403 });
+      expect((await interactionsSvc.getForIssue(issue, interaction.id)).status).toBe("pending");
+    });
+
+    it.each(["expired", "accepted", "rejected", "cancelled"])("denies foreign companies and %s interactions", async (status) => {
+      const { issue, actor, interaction } = await seedParticipant();
+      await expect(interactionsSvc.participate({ ...issue, companyId: randomUUID() }, interaction.id, actor)).rejects.toMatchObject({ status: 404 });
+      await db.update(issueThreadInteractions).set({ status }).where(eq(issueThreadInteractions.id, interaction.id));
+      await expect(interactionsSvc.participate(issue, interaction.id, actor)).rejects.toMatchObject({ status: 409 });
+    });
+
+    it("does not bypass not_creator when the creator is made the addressee", async () => {
+      const { issue, actor, interaction, creatorId } = await seedParticipant();
+      await db.update(issueThreadInteractions).set({ addresseeAgentId: creatorId }).where(eq(issueThreadInteractions.id, interaction.id));
+      await expect(interactionsSvc.participate(issue, interaction.id, { ...actor, agentId: creatorId })).rejects.toMatchObject({ status: 403, details: { code: "interaction_creator_excluded" } });
+    });
+
+    it("requires a run for this issue and refuses a run for a different interaction", async () => {
+      const { issue, actor, interaction } = await seedParticipant();
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: randomUUID(), interactionId: interaction.id } }).where(eq(heartbeatRuns.id, actor.runId));
+      await expect(interactionsSvc.participate(issue, interaction.id, actor)).rejects.toMatchObject({ status: 422 });
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: issue.id, interactionId: randomUUID() } }).where(eq(heartbeatRuns.id, actor.runId));
+      await expect(interactionsSvc.participate(issue, interaction.id, actor)).rejects.toMatchObject({ status: 422 });
+    });
+
+    it("denies a second live participant run even when it has no interaction wake marker", async () => {
+      const { issue, actor, interaction } = await seedParticipant();
+      await db.insert(heartbeatRuns).values({ id: randomUUID(), companyId: issue.companyId, agentId: actor.agentId, status: "running", contextSnapshot: { issueId: issue.id } });
+      await expect(interactionsSvc.participate(issue, interaction.id, actor)).rejects.toMatchObject({ status: 409 });
+    });
+
+    it("rejects only the interaction and preserves the native delivery stage", async () => {
+      const { issue, actor, interaction, creatorId, executionState } = await seedParticipant();
+      await interactionsSvc.participate(issue, interaction.id, actor);
+      const result = await interactionsSvc.rejectInteraction(issue, interaction.id, { reason: "The host head changed; no approval published" }, actor);
+      expect(result.status).toBe("rejected");
+      const [after] = await db.select().from(issues).where(eq(issues.id, issue.id));
+      expect(after).toMatchObject({ assigneeAgentId: creatorId, status: "in_review", checkoutRunId: null, executionRunId: null, executionState });
+    });
+
+    it("denies an ended run both before work and at resolution", async () => {
+      const { issue, actor, interaction } = await seedParticipant();
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, actor.runId));
+      await expect(interactionsSvc.participate(issue, interaction.id, actor)).rejects.toMatchObject({ status: 422 });
+      await expect(interactionsSvc.acceptInteraction(issue, interaction.id, {}, actor)).rejects.toMatchObject({ status: 422 });
+      expect((await interactionsSvc.getForIssue(issue, interaction.id)).status).toBe("pending");
+    });
+
+    it("denies conflicting active issue work without stealing or clearing the lease", async () => {
+      const { issue, actor, interaction, creatorId } = await seedParticipant();
+      await interactionsSvc.participate(issue, interaction.id, actor);
+      const conflictingRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: conflictingRunId, companyId: issue.companyId, agentId: creatorId, status: "running" });
+      await db.update(issues).set({ executionRunId: conflictingRunId, checkoutRunId: conflictingRunId }).where(eq(issues.id, issue.id));
+      await expect(interactionsSvc.participate(issue, interaction.id, actor)).rejects.toMatchObject({ status: 409 });
+      await expect(interactionsSvc.acceptInteraction(issue, interaction.id, {}, actor)).rejects.toMatchObject({ status: 409 });
+      const [after] = await db.select().from(issues).where(eq(issues.id, issue.id));
+      expect(after).toMatchObject({ assigneeAgentId: creatorId, executionRunId: conflictingRunId, checkoutRunId: conflictingRunId });
+      expect((await interactionsSvc.getForIssue(issue, interaction.id)).status).toBe("pending");
+    });
+
+    it("denies a stale document target before participant work", async () => {
+      const { issue, actor, interaction } = await seedParticipant();
+      const target = await attachPlanDocument(issue.companyId, issue.id);
+      await db.update(issueDocuments).set({ key: "review-evidence" }).where(eq(issueDocuments.documentId, target.documentId));
+      await db.update(issueThreadInteractions).set({ payload: { ...interaction.payload, target: { ...target, key: "review-evidence" } } }).where(eq(issueThreadInteractions.id, interaction.id));
+      await db.update(documents).set({ latestRevisionId: randomUUID() }).where(eq(documents.id, target.documentId));
+      await expect(interactionsSvc.participate(issue, interaction.id, actor)).rejects.toMatchObject({ status: 422 });
+    });
+
+    it.each([
+      ["accept", "in_review", false],
+      ["reject", "in_review", false],
+      ["accept", "blocked", true],
+      ["reject", "blocked", true],
+      ["accept", "in_progress", true],
+      ["reject", "in_progress", true],
+    ] as const)("denies an ended reviewer %s on a stale %s target with prior review=%s without any mutation", async (action, issueStatus, priorReview) => {
+      const { issue, actor, interaction, creatorId } = await seedParticipant();
+      if (priorReview) {
+        await db.insert(activityLog).values({ companyId: issue.companyId, actorType: "agent", actorId: creatorId, action: "issue.updated", entityType: "issue", entityId: issue.id, details: { status: "in_review", _previous: { status: "in_progress" } } });
+      }
+      await db.update(issues).set({ status: issueStatus }).where(eq(issues.id, issue.id));
+      const target = await attachPlanDocument(issue.companyId, issue.id);
+      await db.update(issueDocuments).set({ key: "review-evidence" }).where(eq(issueDocuments.documentId, target.documentId));
+      await db.update(issueThreadInteractions).set({ payload: { ...interaction.payload, target: { ...target, key: "review-evidence" } } }).where(eq(issueThreadInteractions.id, interaction.id));
+      await db.update(documents).set({ latestRevisionId: randomUUID() }).where(eq(documents.id, target.documentId));
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, actor.runId));
+      const [beforeInteraction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id));
+      const [beforeIssue] = await db.select().from(issues).where(eq(issues.id, issue.id));
+
+      const resolution = action === "accept"
+        ? interactionsSvc.acceptInteraction(issue, interaction.id, {}, actor)
+        : interactionsSvc.rejectInteraction(issue, interaction.id, { reason: "The host head changed" }, actor);
+      await expect(resolution).rejects.toMatchObject({ status: 422, details: { code: "interaction_run_attribution_required" } });
+
+      const [afterInteraction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id));
+      const [afterIssue] = await db.select().from(issues).where(eq(issues.id, issue.id));
+      expect(afterInteraction).toEqual(beforeInteraction);
+      expect(afterIssue).toEqual(beforeIssue);
+    });
+
+    it("denies active owner work even when no lease pointer is set", async () => {
+      const { issue, actor, interaction, creatorId } = await seedParticipant();
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(), companyId: issue.companyId, agentId: creatorId,
+        status: "running", contextSnapshot: { issueId: issue.id },
+      });
+      await expect(interactionsSvc.participate(issue, interaction.id, actor)).rejects.toMatchObject({ status: 409 });
+      await expect(interactionsSvc.rejectInteraction(issue, interaction.id, { reason: "Stale host head" }, actor)).rejects.toMatchObject({ status: 409 });
+      expect((await interactionsSvc.getForIssue(issue, interaction.id)).status).toBe("pending");
+    });
+  });
+
   async function recordReviewTransition(args: {
     companyId: string;
     issueId: string;

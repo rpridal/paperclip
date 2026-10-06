@@ -710,6 +710,25 @@ describe("openapi routes", () => {
     ).toBeUndefined();
   });
 
+  it("documents agent-only interaction participation without client-supplied authority", () => {
+    const { spec } = loadSpecRoutes();
+    const participation = spec.paths["/api/issues/{id}/interactions/{interactionId}/participate"]?.post;
+
+    expect(participation).toBeDefined();
+    expect(participation.security).toEqual([{ AgentBearerAuth: [] }]);
+    expect(participation["x-paperclip-authorization"]).toEqual({
+      actor: "agent", heartbeatBound: true, interactionBound: true,
+    });
+    expect(participation.requestBody.content["application/json"].schema).toMatchObject({
+      type: "object", properties: {}, additionalProperties: false,
+    });
+    for (const status of ["200", "400", "401", "403", "404", "409", "422"]) {
+      expect(participation.responses[status]).toBeDefined();
+    }
+    expect(participation.description).toContain("running");
+    expect(participation.description).toContain("does not change");
+  });
+
   it("covers the mounted server routes exactly", () => {
     const {
       routes: actualRoutes,
