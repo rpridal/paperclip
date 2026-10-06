@@ -27212,6 +27212,11 @@ export function heartbeatService(
                 opts.queuedCommentInterruptId || opts.queuedCommentRequestId ||
                 reason === "retry_failed_run" || reason === "issue_commented" ||
                 reason === "issue_reopened_via_comment") return false;
+            // Only a system assignment may use this recovery fallback. Replaceable
+            // continuation/dependency polling must preserve the durable no-replay
+            // wait instead of manufacturing assignment authority from eligibility.
+            if (source !== "assignment" || reason !== "issue_assigned" ||
+                opts.requestedByActorType !== "system") return false;
             // Only a plainly re-runnable issue may lose the hold: an open task
             // with a single invokable agent owner and no human owner. An active
             // or escalated action, a conversation owner, or an unsafe workspace

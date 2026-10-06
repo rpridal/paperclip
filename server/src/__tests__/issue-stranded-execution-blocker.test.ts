@@ -243,6 +243,26 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
     expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).not.toBeNull();
   });
 
+  it.each([
+    ["automation", "issue_continuation_needed", "system"],
+    ["automation", "issue_blockers_resolved", "system"],
+    ["automation", "issue_assigned", "system"],
+    ["assignment", "issue_continuation_needed", "system"],
+    ["assignment", "issue_assigned", "agent"],
+  ] as const)("preserves the settled hold for non-assignment authority (%s/%s/%s)", async (source, reason, actorType) => {
+    const seed = await seedBlockedIssue({ issueStatus: "todo", replay: "blocked" });
+    const wake = await heartbeatService(db).wakeup(seed.agentId, {
+      source, triggerDetail: "system", reason,
+      requestedByActorType: actorType, requestedByActorId: "assignment",
+      payload: { issueId: seed.issueId }, contextSnapshot: { issueId: seed.issueId },
+    });
+    expect(wake).toBeNull();
+    expect(await runsForIssue(seed.issueId)).toHaveLength(0);
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, seed.actionId));
+    expect(action!.evidence.settledNoReplayHoldReleasedAt).toBeUndefined();
+    expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).not.toBeNull();
+  });
+
   it("T2: an open recovery action still parks the wake", async () => {
     const seed = await seedBlockedIssue({ issueStatus: "todo", recoveryStatus: "active", replay: "blocked" });
     expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).not.toBeNull();
