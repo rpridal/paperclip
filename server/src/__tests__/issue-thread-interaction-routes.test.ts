@@ -680,6 +680,40 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
+  it.each(["accepted", "rejected", "answered", "cancelled", "expired", "failed"])(
+    "does not wake an addressed agent when creation replays a %s interaction",
+    async (status) => {
+      mockInteractionService.create.mockResolvedValueOnce({
+        id: "interaction-replayed",
+        companyId: "company-1",
+        issueId: ISSUE_ID,
+        kind: "request_confirmation",
+        status,
+        continuationPolicy: "none",
+        addresseeAgentId: UNRELATED_AGENT_ID,
+        requestedResolverPolicy: "anyone",
+        effectiveResolverPolicy: "anyone",
+        idempotencyKey: "confirmation-replay",
+        payload: { version: 1, prompt: "Review this work" },
+        result: { version: 1, outcome: status },
+      });
+      const app = await createApp();
+      const response = await request(app)
+        .post(`/api/issues/${ISSUE_ID}/interactions`)
+        .send({
+          kind: "request_confirmation",
+          addresseeAgentId: UNRELATED_AGENT_ID,
+          idempotencyKey: "confirmation-replay",
+          payload: { version: 1, prompt: "Review this work" },
+        });
+
+      expect(response.status).toBe(201);
+      expect(response.body.id).toBe("interaction-replayed");
+      expect(response.body.status).toBe(status);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    },
+  );
+
   it("does not route agent attention for a human-only interaction", async () => {
     mockInteractionService.create.mockResolvedValueOnce({
       id: "interaction-human-attention",
