@@ -756,7 +756,14 @@ downstream capability.
 
 An agent addressed by a pending `request_confirmation` may perform the bounded
 confirmation work without checking out or taking ownership of the issue. The
-agent first calls `POST /api/issues/:issueId/interactions/:interactionId/participate`
+server admits an `interaction_pending` wake only after it reads the exact stored
+interaction and revalidates the participation audience, current target, and
+active-work conflicts under issue/run locks. Queued admission and final running
+pre-dispatch validation do not transfer ownership or create a participant grant.
+Generic review reasons do not establish this scope. Dependency and subtree
+holds remain enforced.
+
+The agent first calls `POST /api/issues/:issueId/interactions/:interactionId/participate`
 with an empty object. This is a stateless preflight, not a participant grant or
 lease. The server requires a live run for that agent, company, and issue; an
 interaction ID in run context must match when present. Audience and current

@@ -13,6 +13,7 @@ import {
   issueDocuments,
   issueRelations,
   issueRecoveryActions,
+  issueThreadInteractions,
   issueTreeHolds,
   issues,
 } from "@paperclipai/db";
@@ -52,6 +53,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
 
   afterEach(async () => {
     await db.delete(activityLog);
+    await db.delete(issueThreadInteractions);
     await db.delete(issueDocuments);
     await db.delete(documentRevisions);
     await db.delete(documents);
@@ -521,6 +523,132 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   });
 
   describe("cancelStaleQueuedRun", () => {
+    it.each([
+      { scenario: "addressed pending confirmation", expected: "not_stale" },
+      { scenario: "current document target", expected: "not_stale" },
+      { scenario: "wrong addressee", expected: "cancelled" },
+      { scenario: "unaddressed confirmation", expected: "cancelled" },
+      { scenario: "creator excluded", expected: "cancelled" },
+      { scenario: "human-only policy", expected: "cancelled" },
+      { scenario: "resolved confirmation", expected: "cancelled" },
+      { scenario: "closed issue", expected: "cancelled" },
+      { scenario: "finished run", expected: "cancelled" },
+      { scenario: "generic review reason", expected: "cancelled" },
+      { scenario: "unknown interaction", expected: "cancelled" },
+      { scenario: "active owner", expected: "cancelled" },
+      { scenario: "duplicate reviewer", expected: "cancelled" },
+      { scenario: "stale document target", expected: "cancelled" },
+      { scenario: "plan confirmation", expected: "cancelled" },
+      { scenario: "foreign company interaction", expected: "cancelled" },
+      { scenario: "governed tool action", expected: "cancelled" },
+      { scenario: "governed secret proposal", expected: "cancelled" },
+    ].flatMap((entry) => (["queued", "running"] as const).map((runStatus) => ({ ...entry, runStatus }))))
+      ("$runStatus $scenario wake preserves ownership and yields $expected", async ({ scenario, expected, runStatus }) => {
+      const { companyId, agentId: ownerId } = await seedCompanyAndAgent();
+      const reviewerId = randomUUID();
+      const issueId = randomUUID();
+      const interactionId = randomUUID();
+      await seedAgent({ id: reviewerId, companyId, name: "IndependentReviewer" });
+      await seedIssue({ companyId, issueId, status: "in_review", assigneeAgentId: ownerId });
+      await db.insert(issueThreadInteractions).values({
+        id: interactionId, companyId, issueId, kind: "request_confirmation",
+        status: "pending", createdByAgentId: ownerId, addresseeAgentId: reviewerId,
+        requestedResolverPolicy: "not_creator", effectiveResolverPolicy: "not_creator",
+        resolverPolicyProvenance: "explicit", effectiveResolverPolicySource: "requested",
+        payload: { version: 1, prompt: "Review the exact requested PR head" },
+      });
+      const runId = await seedRun({
+        companyId, agentId: reviewerId, status: runStatus,
+        contextSnapshot: { issueId, taskId: issueId, interactionId,
+          interactionKind: "request_confirmation", wakeReason: "interaction_pending",
+          source: "issue.interaction.created" },
+      });
+      if (scenario === "wrong addressee" || scenario === "unaddressed confirmation") {
+        await db.update(issueThreadInteractions).set({
+          addresseeAgentId: scenario === "wrong addressee" ? ownerId : null,
+        }).where(eq(issueThreadInteractions.id, interactionId));
+      }
+      if (scenario === "creator excluded") {
+        await db.update(issueThreadInteractions).set({ createdByAgentId: reviewerId })
+          .where(eq(issueThreadInteractions.id, interactionId));
+      }
+      if (scenario === "human-only policy") {
+        await db.update(issueThreadInteractions).set({ effectiveResolverPolicy: "human_only" })
+          .where(eq(issueThreadInteractions.id, interactionId));
+      }
+      if (scenario === "resolved confirmation") {
+        await db.update(issueThreadInteractions).set({ status: "accepted" })
+          .where(eq(issueThreadInteractions.id, interactionId));
+      }
+      if (scenario === "closed issue") {
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      }
+      if (scenario === "finished run") {
+        await db.update(heartbeatRuns).set({ finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+      }
+      if (scenario === "generic review reason" || scenario === "unknown interaction") {
+        await db.update(heartbeatRuns).set({ contextSnapshot: {
+          issueId, taskId: issueId,
+          interactionId: scenario === "unknown interaction" ? randomUUID() : interactionId,
+          wakeReason: scenario === "generic review reason" ? "review_request" : "interaction_pending",
+        } }).where(eq(heartbeatRuns.id, runId));
+      }
+      if (scenario === "active owner" || scenario === "duplicate reviewer") {
+        await seedRun({ companyId, agentId: scenario === "active owner" ? ownerId : reviewerId,
+          status: "running", contextSnapshot: { issueId } });
+      }
+      if (scenario === "stale document target" || scenario === "plan confirmation") {
+        await db.update(issueThreadInteractions).set({ payload: {
+          version: 1, prompt: "Review requested document",
+          target: { type: "issue_document", issueId,
+            key: scenario === "plan confirmation" ? "plan" : "review-evidence",
+            revisionId: randomUUID() },
+        } }).where(eq(issueThreadInteractions.id, interactionId));
+      }
+      if (scenario === "current document target") {
+        await seedContinuationSummary({ companyId, issueId, agentId: ownerId, body: "Exact PR head evidence" });
+        const [document] = await db.select().from(documents).where(eq(documents.companyId, companyId));
+        await db.update(issueThreadInteractions).set({ payload: {
+          version: 1, prompt: "Review current evidence",
+          target: { type: "issue_document", issueId, key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+            revisionId: document.latestRevisionId!, revisionNumber: 1 },
+        } }).where(eq(issueThreadInteractions.id, interactionId));
+      }
+      if (scenario === "foreign company interaction") {
+        const { companyId: otherCompanyId } = await seedCompanyAndAgent();
+        await db.update(issueThreadInteractions).set({ companyId: otherCompanyId })
+          .where(eq(issueThreadInteractions.id, interactionId));
+      }
+      if (scenario === "governed tool action") {
+        await db.update(issueThreadInteractions).set({ payload: {
+          version: 1, prompt: "Approve governed action",
+          toolAction: { version: 1, actionRequestId: randomUUID(), invocationId: randomUUID(),
+            toolName: "deploy", toolDisplayName: "Deploy", connectionId: null,
+            applicationId: null, appDisplayName: null, risk: "write",
+            previewMarkdown: "Production change", argumentsSummaryJson: "{}",
+            argumentsHash: "fixture", expiresAt: new Date(Date.now() + 60_000).toISOString() },
+        } }).where(eq(issueThreadInteractions.id, interactionId));
+      }
+      if (scenario === "governed secret proposal") {
+        await db.update(issueThreadInteractions).set({ payload: {
+          version: 1, prompt: "Approve secret binding",
+          secretProposal: { version: 1, proposalId: randomUUID(), sourceSecretLabel: "Fixture",
+            configPath: "env.FIXTURE", targetAgentId: reviewerId, targetAgentName: "Reviewer",
+            justification: "Governed proposal", expiresAt: new Date(Date.now() + 60_000).toISOString() },
+        } }).where(eq(issueThreadInteractions.id, interactionId));
+      }
+      const originalIssue = await db.select().from(issues).where(eq(issues.id, issueId));
+      const originalInteractions = await db.select().from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, interactionId));
+      const outcome = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId, companyId, expectedStatus: runStatus, now: new Date(),
+      });
+      expect(outcome).toMatchObject({ outcome: expected });
+      expect(await db.select().from(issues).where(eq(issues.id, issueId))).toEqual(originalIssue);
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId)))
+        .toEqual(originalInteractions);
+    });
+
     it.each([
       { label: "chat source", source: "chat:slack", expected: "chat:slack" },
       {
