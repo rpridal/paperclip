@@ -22497,6 +22497,7 @@ export function heartbeatService(
         if (
           !issueId ||
           (!isResolvedInteractionContinuationWakeContext(context) &&
+            context.wakeReason !== "interaction_pending" &&
             run.scheduledRetryReason !== "native_safe_replacement")
         ) {
           return { dispatched: true, resultPromise: dispatch(() => {}) };

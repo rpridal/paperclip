@@ -813,6 +813,77 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     },
   );
 
+  it.each(["unchanged", "resolved", "unaddressed", "closed", "stale target", "active owner", "duplicate reviewer"])(
+    "revalidates addressed confirmation %s at the provider boundary without taking ownership",
+    async (mutation) => {
+      const { companyId, agentId: reviewerId } = await seedCompanyAndAgent();
+      const ownerId = randomUUID();
+      await db.insert(agents).values({
+        id: ownerId, companyId, name: "ConfirmationOwner", role: "engineer",
+        status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+      const issueId = randomUUID();
+      const interactionId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId, companyId, title: "Addressed confirmation final boundary", status: "in_review",
+        priority: "medium", assigneeAgentId: ownerId,
+      });
+      await seedContinuationSummary({ companyId, issueId, agentId: ownerId, body: "Current evidence" });
+      const [document] = await db.select().from(documents).where(eq(documents.companyId, companyId));
+      await db.insert(issueThreadInteractions).values({
+        id: interactionId, companyId, issueId, kind: "request_confirmation", status: "pending",
+        createdByAgentId: ownerId, addresseeAgentId: reviewerId, requestedResolverPolicy: "not_creator",
+        effectiveResolverPolicy: "not_creator", resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "requested", payload: {
+          version: 1, prompt: "Review current evidence", target: {
+            type: "issue_document", issueId, key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+            revisionId: document.latestRevisionId!, revisionNumber: 1,
+          },
+        },
+      });
+      const { runId } = await seedQueuedRun({
+        companyId, agentId: reviewerId, issueId, wakeReason: "interaction_pending",
+        contextExtras: { interactionId, interactionKind: "request_confirmation", source: "issue.interaction.created" },
+      });
+      let boundaryReached = false;
+      let conflictRunId: string | null = null;
+      beforeContinuationDispatchCheck = async ({ runId: checkedRunId }) => {
+        expect(checkedRunId).toBe(runId);
+        boundaryReached = true;
+        if (mutation === "resolved") {
+          await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, interactionId));
+        } else if (mutation === "unaddressed") {
+          await db.update(issueThreadInteractions).set({ addresseeAgentId: null }).where(eq(issueThreadInteractions.id, interactionId));
+        } else if (mutation === "closed") {
+          await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+        } else if (mutation === "stale target") {
+          await db.update(documents).set({ latestRevisionId: randomUUID() }).where(eq(documents.id, document.id));
+        } else if (mutation === "active owner" || mutation === "duplicate reviewer") {
+          conflictRunId = randomUUID();
+          await db.insert(heartbeatRuns).values({
+            id: conflictRunId, companyId, agentId: mutation === "active owner" ? ownerId : reviewerId,
+            invocationSource: "assignment", triggerDetail: "system", status: "running", contextSnapshot: { issueId },
+          });
+        }
+      };
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForCondition(async () => {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        return !!run && run.status !== "queued" && run.status !== "running";
+      })).toBe(true);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      if (conflictRunId) await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, conflictRunId));
+      expect(boundaryReached).toBe(true);
+      expect(countExecuteCallsForRun(runId)).toBe(mutation === "unchanged" ? 1 : 0);
+      expect(run.status).toBe(mutation === "unchanged" ? "succeeded" : "cancelled");
+      expect(issue).toMatchObject({
+        assigneeAgentId: ownerId, executionRunId: null, checkoutRunId: null,
+        status: mutation === "closed" ? "done" : "in_review",
+      });
+    },
+  );
+
   it("rejects ownership changes immediately before the final continuation handoff", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();

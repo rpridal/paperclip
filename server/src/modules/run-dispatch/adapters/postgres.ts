@@ -1014,13 +1014,13 @@ export function createPostgresRunDispatchAdapter(
       if (run.status !== input.expectedStatus) {
         return { dispatched: false as const, cancellation: { outcome: "lost_race" as const } };
       }
-      const { issueId, decision: initialDecision } = await decideCurrentRunStaleness(
+      const { issueId, facts, decision: initialDecision } = await decideCurrentRunStaleness(
         tx,
         run,
         input.now,
       );
       const decision =
-        !initialDecision.stale && issueId
+        !initialDecision.stale && issueId && !facts?.isAddressedConfirmationParticipant
           ? await tx
               .select({ executionRunId: issues.executionRunId })
               .from(issues)
