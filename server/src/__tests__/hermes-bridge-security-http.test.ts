@@ -17,7 +17,7 @@ describe('Hermes bridge security over disposable HTTP', () => {
         res.end(JSON.stringify({ run_id: 'security-run' }));
       } else if (_req.url?.endsWith('/events')) {
         res.setHeader('Content-Type', 'text/event-stream');
-        res.end(`event: message.delta\ndata: ${JSON.stringify({ delta: credential, message: headerValue, nested: { innocent: [credential, headerValue] } })}\n\nevent: run.completed\ndata: {"status":"completed","output":"done"}\n\n`);
+        res.end(`event: message.delta\ndata: ${JSON.stringify({ delta: credential, message: headerValue, nested: { innocent: [credential, headerValue] } })}\n\nevent: run.completed\ndata: {"run_id":"security-run","status":"completed","output":"done"}\n\n`);
       } else {
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify({ status: 'completed' }));

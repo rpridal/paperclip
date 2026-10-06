@@ -110,7 +110,7 @@ describe("execute", () => {
       }
       if (url.endsWith("/events")) {
         return new Response(
-          sseStream(["event: run.completed", "data: {\"status\":\"completed\",\"output\":\"done\"}", ""].join("\n")),
+          sseStream(["event: run.completed", "data: {\\\"run_id\\\":\\\"run-hermes-1\\\",\\\"status\\\":\\\"completed\\\",\\\"output\\\":\\\"done\\\"}", ""].join("\\n")),
           { status: 200, headers: { "content-type": "text/event-stream" } },
         );
       }
@@ -138,7 +138,7 @@ describe("execute", () => {
               "data: {\"delta\":\"done\"}",
               "",
               "event: run.completed",
-              "data: {\"status\":\"completed\",\"output\":\"done\",\"session_id\":\"session-1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2},\"model\":\"hermes-agent\"}",
+              "data: {\"run_id\":\"run-hermes-1\",\"status\":\"completed\",\"output\":\"done\",\"session_id\":\"session-1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2},\"model\":\"hermes-agent\"}",
               "",
             ].join("\n"),
           ),
@@ -383,7 +383,7 @@ describe("execute", () => {
               "data: {\"delta\":\"Authorization: Bearer secret-key\\nX-Hermes-Session-Key: paperclip:company:company-1:agent:agent-1:issue:issue-1\"}",
               "",
               "event: run.completed",
-              "data: {\"status\":\"completed\",\"output\":\"Authorization: Bearer secret-key\\nraw key secret-key\\nX-Hermes-Session-Key: paperclip:company:company-1:agent:agent-1:issue:issue-1\"}",
+              "data: {\"run_id\":\"run-hermes-1\",\"status\":\"completed\",\"output\":\"Authorization: Bearer secret-key raw key secret-key\\nX-Hermes-Session-Key: paperclip:company:company-1:agent:agent-1:issue:issue-1\"}",
               "",
             ].join("\n"),
           ),

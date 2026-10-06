@@ -504,6 +504,21 @@ function approvalRequestId(eventName: string | null, value: Record<string, unkno
   return requestId && requestId.length <= 256 ? requestId : null;
 }
 
+/**
+ * Terminal proof must carry this run's provider identity. A final status
+ * envelope for another provider run (or one that omits the id entirely) is not
+ * evidence about this run, so it must not mark the run complete or close its
+ * consent lifecycle. Envelopes without an explicit id stay compatible with the
+ * polling path, which is already bound to this run by the request URL.
+ */
+function terminalEnvelopeMatchesRun(value: unknown, providerRunId: string, allowMissing = false): boolean {
+  const record = asRecord(value);
+  if (!record) return allowMissing;
+  const explicit = nonEmpty(record.run_id) ?? nonEmpty(record.runId);
+  if (!explicit) return allowMissing;
+  return explicit === providerRunId;
+}
+
 async function reportLegacyApproval(
   ctx: AdapterExecutionContext,
   state: ExecutionState,
@@ -552,18 +567,25 @@ async function handleEvent(
   const parsed = parseJsonData(frame.data);
   const record = asRecord(parsed);
   const eventName = eventNameFromData(parsed, frame.event);
-  const status = extractStatus(parsed) ?? (eventName?.startsWith("run.") ? eventName.slice(4) : null);
+  // Terminal identity is settled on the raw frame data only. A run.<status>
+  // event name carries no provider id, so it cannot prove which provider run
+  // ended and must never close this run's lifecycle or consent. The exact
+  // provider envelope still logs normally; its settlement fence is applied
+  // after the log, so older consent-publication tests keep their ordering.
+  const frameRecord = asRecord(parseJsonData(frame.data));
+  const status = extractStatus(frameRecord);
   const isTerminal = Boolean(status && TERMINAL_STATUSES.has(status));
+  const terminalProvesThisRun = isTerminal && terminalEnvelopeMatchesRun(frameRecord, state.runId);
   if (state.lifecycleClosed || ctx.signal?.aborted) return;
   // Terminal proof settles independently of logging/publication. markTerminal
   // also closes consent synchronously, fencing callbacks and old resolvers.
-  if (isTerminal && status) {
+  if (terminalProvesThisRun && status) {
     markTerminal(state, {
       runId: state.runId,
       status,
       eventName,
-      payload: record,
-      output: extractOutput(parsed),
+      payload: frameRecord,
+      output: extractOutput(frameRecord),
     });
   }
   state.lastEventName = eventName;
@@ -572,6 +594,8 @@ async function handleEvent(
     `[hermes-gateway:event] run=${state.runId} event=${eventName ?? "message"} data=${stringifyForLog(redactForLog(parsed, [], 0, redactText), 8_000)}\n`,
   );
   if ((state.lifecycleClosed && !isTerminal) || ctx.signal?.aborted) return;
+  // A non-matching terminal envelope never publishes consent.
+  if (terminalProvesThisRun) return;
   if (resolveLegacyApproval) {
     await reportLegacyApproval(ctx, state, eventName, record, resolveLegacyApproval, redactText);
   }
@@ -632,7 +656,7 @@ async function pollStatus(input: {
       const record = asRecord(status);
       // Consent closure must not disable the independent terminal fallback.
       if (input.signal.aborted) return;
-      if (normalized && TERMINAL_STATUSES.has(normalized)) {
+      if (normalized && TERMINAL_STATUSES.has(normalized) && terminalEnvelopeMatchesRun(status, input.state.runId, true)) {
         markTerminal(input.state, {
           runId: input.state.runId,
           status: normalized,
@@ -1108,10 +1132,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (outcome === "timeout" || outcome === "cancelled") {
     const stopped = await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
     const stoppedStatus = extractStatus(stopped);
-    const finalStatus = extractRunId(stopped) === runId && stoppedStatus && TERMINAL_STATUSES.has(stoppedStatus)
+    // A stop acknowledgement for another provider run proves nothing about this
+    // run, so it is not accepted as this run's final status either.
+    const stoppedMatchesRun = terminalEnvelopeMatchesRun(stopped, runId, true);
+    const finalStatus = stoppedMatchesRun && extractRunId(stopped) === runId && stoppedStatus && TERMINAL_STATUSES.has(stoppedStatus)
       ? stopped
       : await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
-    const terminationConfirmed = Boolean(finalStatus);
+    const finalStatusRunId = extractRunId(finalStatus);
+    // Exact provider identity is the only accepted termination proof: another
+    // run's envelope (or a missing run id where the provider must report it)
+    // leaves cancellation unconfirmed instead of claiming this run ended.
+    const terminationConfirmed = Boolean(finalStatus) && finalStatusRunId === runId;
+    const reportedStatus = extractStatus(finalStatus) ?? (finalStatus ? stoppedStatus : null) ?? null;
     return {
       exitCode: 1,
       signal: outcome === "cancelled" ? "SIGTERM" : null,
@@ -1125,9 +1157,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       provider: "hermes_gateway",
       resultJson: {
         run_id: runId,
-        status: extractStatus(finalStatus) ?? "unknown",
+        status: reportedStatus ?? "unknown",
         last_event: state.lastEventName,
-        final_status: redactForLog(finalStatus, [], 0, redactText),
+        final_status: finalStatus ? redactForLog(finalStatus, [], 0, redactText) : null,
       },
       sessionParams: {
         hermesRunId: runId,
