@@ -1202,7 +1202,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
   }, 120_000);
 
   it.each([
-    { caseName: "allows a non-assignee mention on completed work", targetAssignee: false, terminalStatus: "done", explicitResume: false },
+    { caseName: "cancels a non-assignee mention without resume intent on completed work", targetAssignee: false, terminalStatus: "done", explicitResume: false },
     { caseName: "delivers explicit agent feedback after completion", targetAssignee: true, terminalStatus: "done", explicitResume: true },
     { caseName: "cancels an assignee continuation without resume intent on completed work", targetAssignee: true, terminalStatus: "done", explicitResume: false },
     { caseName: "cancels an assignee continuation on cancelled work", targetAssignee: true, terminalStatus: "cancelled", explicitResume: true },
@@ -1372,6 +1372,40 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         .where(eq(issues.id, issueId));
 
       gateway.releaseFirstWait();
+
+      if (!targetAssignee && !shouldReopen) {
+        await waitFor(async () => {
+          const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+          return runs.length === 2 && runs.every((run) =>
+            run.id === firstRun!.id ? run.status === "succeeded" : run.status === "cancelled",
+          );
+        });
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+        const cancelled = runs.find((run) => run.id !== firstRun!.id);
+        expect(cancelled).toMatchObject({
+          agentId: targetAgentId,
+          status: "cancelled",
+          errorCode: "issue_terminal_status",
+          startedAt: null,
+          contextSnapshot: expect.objectContaining({ issueId, wakeReason }),
+          resultJson: expect.objectContaining({ stopReason: "issue_terminal_status" }),
+        });
+        expect(cancelled!.wakeupRequestId).not.toBeNull();
+        const wakes = await db.select().from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.id, cancelled!.wakeupRequestId!),
+        ));
+        expect(wakes).toEqual([expect.objectContaining({ status: "skipped" })]);
+        expect(gateway.getAgentPayloads()).toHaveLength(1);
+        const [closedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+        expect(closedIssue).toMatchObject({
+          status: terminalStatus, assigneeAgentId, executionRunId: null,
+        });
+        expect(closedIssue.completedAt).not.toBeNull();
+        const [retainedComment] = await db.select().from(issueComments).where(eq(issueComments.id, comment.id));
+        expect(retainedComment.body).toContain("please review after I finish");
+        return;
+      }
 
       if (targetAssignee && !shouldReopen) {
         await waitFor(async () => {

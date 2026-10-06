@@ -45,6 +45,15 @@ authorized resolver path.
 
 ## Fail-closed conditions and limits
 
+The `interaction_pending` wake must carry the exact stored interaction ID.
+Queued and final pre-dispatch admission read the current interaction under the
+issue/run locks. They reuse the participation audience, target, and active-work
+guards. Admission does not change issue ownership, leases, stages, or resolution.
+A generic `review_request` reason is not sufficient. Native-completion review
+markers are neither required nor synthesized for an external addressed review.
+The agent must still call the live-run participation route before host work.
+This admission change does not relax dependency holds or subtree pause holds.
+
 - The actor and run come from authentication, never the request body. Additional
   body fields are rejected. Board actors do not use this agent preflight.
 - Company/read boundaries, low-trust and task-bridge containment, named audience,

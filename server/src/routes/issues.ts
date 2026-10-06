@@ -15970,6 +15970,7 @@ export function issueRoutes(
       });
 
       if (
+        interaction.status === "pending" &&
         interaction.addresseeAgentId &&
         issueThreadInteractionAttentionAgentAllowed({
           agentId: interaction.addresseeAgentId,

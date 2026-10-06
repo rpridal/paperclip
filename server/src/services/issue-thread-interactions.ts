@@ -86,7 +86,7 @@ import {
   withdrawIssueThreadInteractionSchema,
 } from "@paperclipai/shared";
 import { z } from "zod";
-import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import {
   logActivity,
@@ -484,6 +484,7 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
   interaction: IssueThreadInteractionRow,
   actor: InteractionActor,
   participationRequired = false,
+  participantRunStatus: "queued" | "running" = "running",
 ) {
   if (isTerminalIssueStatus(issue.status)) {
     throw conflict(
@@ -506,6 +507,7 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
       interaction,
       actor,
       participationRequired,
+      participantRunStatus,
     );
   }
   if (actor.agentId && isNativeCompletionReview(interaction)) {
@@ -559,6 +561,7 @@ async function assertScopedInteractionParticipationUnderLock(
   interaction: IssueThreadInteractionRow,
   actor: InteractionActor,
   required = false,
+  participantRunStatus: "queued" | "running" = "running",
 ) {
   if (!isScopedInteractionParticipant(issue, interaction, actor)) {
     if (required) {
@@ -585,7 +588,7 @@ async function assertScopedInteractionParticipationUnderLock(
   const context = run?.contextSnapshot;
   if (
     !run ||
-    run.status !== "running" ||
+    run.status !== participantRunStatus ||
     run.finishedAt ||
     (context?.issueId ?? context?.taskId) !== issue.id ||
     (context?.interactionId != null && context.interactionId !== interaction.id)
@@ -648,6 +651,40 @@ async function assertScopedInteractionParticipationUnderLock(
     .limit(1);
   if (conflicts.length > 0) {
     throw conflict("Conflicting active work prevents interaction participation");
+  }
+}
+
+export async function isAddressedConfirmationRun(
+  db: Db,
+  input: { companyId: string; issueId: string; agentId: string; runId: string },
+): Promise<boolean> {
+  const run = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.agentId, input.agentId),
+  )).for("update").then((rows) => rows[0] ?? null);
+  const context = run?.contextSnapshot;
+  if (!run || !["queued", "running"].includes(run.status) || run.finishedAt ||
+    context?.wakeReason !== "interaction_pending" ||
+    typeof context.interactionId !== "string" ||
+    (context.issueId ?? context.taskId) !== input.issueId) return false;
+  const issue = await db.select().from(issues).where(and(
+    eq(issues.id, input.issueId), eq(issues.companyId, input.companyId),
+  )).for("update").then((rows) => rows[0] ?? null);
+  const interaction = await db.select().from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.id, context.interactionId),
+    eq(issueThreadInteractions.companyId, input.companyId),
+    eq(issueThreadInteractions.issueId, input.issueId),
+  )).for("update").then((rows) => rows[0] ?? null);
+  if (!issue || !interaction || interaction.status !== "pending") return false;
+  try {
+    await assertRequestConfirmationResolutionAllowedUnderLock(
+      db, issue, interaction, { agentId: input.agentId, runId: input.runId },
+      true, run.status as "queued" | "running",
+    );
+    return true;
+  } catch (error) {
+    if (error instanceof HttpError && error.status >= 400 && error.status < 500) return false;
+    throw error;
   }
 }
 

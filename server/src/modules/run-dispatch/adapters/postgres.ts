@@ -34,6 +34,7 @@ import {
   getIssueContinuationSummaryDocument,
 } from "../../../services/issue-continuation-summary.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
+import { isAddressedConfirmationRun } from "../../../services/issue-thread-interactions.js";
 import { decideQueuedRunStaleness, decideScheduledRetryGate } from "../domain/policy.js";
 import type {
   QueuedRunFacts,
@@ -604,6 +605,11 @@ export function createPostgresRunDispatchAdapter(
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
+      isAddressedConfirmationParticipant: issue && context.wakeReason === "interaction_pending"
+        ? await isAddressedConfirmationRun(dbOrTx, {
+            companyId: input.companyId, issueId, agentId: input.agentId, runId: input.runId,
+          })
+        : false,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
@@ -1008,13 +1014,13 @@ export function createPostgresRunDispatchAdapter(
       if (run.status !== input.expectedStatus) {
         return { dispatched: false as const, cancellation: { outcome: "lost_race" as const } };
       }
-      const { issueId, decision: initialDecision } = await decideCurrentRunStaleness(
+      const { issueId, facts, decision: initialDecision } = await decideCurrentRunStaleness(
         tx,
         run,
         input.now,
       );
       const decision =
-        !initialDecision.stale && issueId
+        !initialDecision.stale && issueId && !facts?.isAddressedConfirmationParticipant
           ? await tx
               .select({ executionRunId: issues.executionRunId })
               .from(issues)

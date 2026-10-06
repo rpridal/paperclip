@@ -146,6 +146,7 @@ export type QueuedRunFacts = {
   /** A connection resolution or tool refresh can resume an agent waiting in review. */
   isConnectionContinuation?: boolean;
   isInteractionWake: boolean;
+  isAddressedConfirmationParticipant?: boolean;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
 
@@ -168,6 +169,7 @@ type OwnershipFacts = {
   issueAssigneeAgentId: string | null;
   isNonAssigneeWorkspaceBusyRetry: boolean;
   isInteractionWake?: boolean;
+  isAddressedConfirmationParticipant?: boolean;
   isCurrentReviewParticipant?: boolean;
   isAuthorizedSourceScopedRecovery?: boolean;
 };
@@ -183,6 +185,7 @@ function decideIssueOwnership(facts: OwnershipFacts): OwnershipOutcome {
   if (facts.issueAssigneeAgentId === facts.runAgentId) return "current_owner";
   if (facts.isNonAssigneeWorkspaceBusyRetry) return "current_owner";
   if (facts.isInteractionWake) return "current_owner";
+  if (facts.isAddressedConfirmationParticipant) return "current_owner";
   if (facts.isCurrentReviewParticipant) return "current_owner";
   if (facts.isAuthorizedSourceScopedRecovery) return "current_owner";
   return "reassigned";
@@ -564,6 +567,7 @@ export function decideQueuedRunStaleness(
     issueAssigneeAgentId: facts.issueAssigneeAgentId,
     isNonAssigneeWorkspaceBusyRetry: facts.isNonAssigneeWorkspaceBusyRetry,
     isInteractionWake: facts.isInteractionWake,
+    isAddressedConfirmationParticipant: facts.isAddressedConfirmationParticipant,
     isCurrentReviewParticipant:
       facts.reviewParticipant.isInReview &&
       facts.reviewParticipant.participantIsAgent &&
@@ -665,7 +669,7 @@ export function decideQueuedRunStaleness(
   const participantOutcome = decideReviewParticipant({
     ...facts.reviewParticipant,
     runAgentId: facts.runAgentId,
-    bypass: facts.wakeCommentIdPresent,
+    bypass: facts.wakeCommentIdPresent || facts.isAddressedConfirmationParticipant === true,
   });
   if (participantOutcome === "participant_changed") {
     return {
