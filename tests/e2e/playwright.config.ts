@@ -47,7 +47,8 @@ export default defineConfig({
     baseURL: BASE_URL,
     headless: true,
     screenshot: "only-on-failure",
-    trace: "on-first-retry",
+    // CI has retries: 0, so on-first-retry never captures the failed attempt.
+    trace: process.env.CI ? "retain-on-failure" : "on-first-retry",
   },
   projects: [
     {
