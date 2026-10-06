@@ -17,7 +17,7 @@ import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from
 import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
-import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
+import { executionBlockerPredicate, getExecutionBlocker, isSettledNoReplayHoldOnly, releaseSettledNoReplayHold } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
@@ -261,6 +261,10 @@ import {
   PROVIDER_TRACE_MAX_BYTES,
 } from "./provider-trace-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
+import {
+  clearLegacyToolApprovalsForRun,
+  registerLegacyToolApproval,
+} from "./legacy-tool-approval-registry.js";
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
@@ -23008,6 +23012,55 @@ export function heartbeatService(
           });
         };
 
+        const onLegacyToolApproval = async (approval: import("@paperclipai/adapter-utils").AdapterLegacyToolApproval) => {
+          const activeRun = await getRun(currentRun.id);
+          if (!activeRun) return;
+          if (activeRun.status !== "running" ||
+              parseObject(parseObject(activeRun.resultJson).executionCancellation).state === "requested") {
+            await clearLegacyToolApprovalsForRun(currentRun.id);
+            return;
+          }
+          // Persist only public, typed identifiers; the adapter retains its bearer credential
+          // inside the process-local resolver closure.
+          const registered = registerLegacyToolApproval({
+            runId: currentRun.id,
+            companyId: currentRun.companyId,
+            agentId: currentRun.agentId,
+            approval,
+            beforeProvider: async () => {
+              const latest = await getRun(currentRun.id);
+              return !latest || latest.status !== "running" ||
+                parseObject(parseObject(latest.resultJson).executionCancellation).state === "requested"
+                ? "cancel" : null;
+            },
+            audit: async event => {
+              // Await durable activity insertion, not best-effort run-log/live
+              // publication. Prompt/command/credential never enter this audit.
+              await logActivity(db, {
+                companyId: currentRun.companyId,
+                actorType: "system", actorId: "legacy-consent-bridge",
+                action: `legacy.tool_approval.${event.phase}`,
+                entityType: "heartbeat_run", entityId: currentRun.id,
+                runId: currentRun.id, agentId: currentRun.agentId,
+                details: { ...event },
+              });
+            },
+          });
+          if (!registered) return;
+          await appendRunEvent(currentRun, {
+            eventType: "legacy.tool_approval.requested",
+            stream: "system",
+            level: "warn",
+            message: "A Hermes tool action is waiting for designated consent; resolver authority is unavailable.",
+            payload: {
+              provider: approval.provider,
+              providerRunId: approval.providerRunId,
+              requestId: approval.requestId,
+              choices: approval.choices,
+            },
+          });
+        };
+
         const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
           const eventType = event.eventType.trim();
           if (!eventType) return;
@@ -24366,6 +24419,7 @@ export function heartbeatService(
                     onLog,
                     onMeta: onAdapterMeta,
                     onEvent: onAdapterEvent,
+                    onLegacyToolApproval,
                     startupTraceContext: getStartupTraceContext(),
                     onRuntimeProgress: async (progress) => {
                       await recordCurrentHeartbeatRunRuntimeProgress(
@@ -24421,6 +24475,7 @@ export function heartbeatService(
               );
             if (!guardedDispatch.dispatched) return;
             adapterResult = await guardedDispatch.resultPromise;
+            await clearLegacyToolApprovalsForRun(run.id);
           }
           adapterResult = applyWorkspaceRestoreFailure(adapterResult);
           // A returned result can include a failed restore. Keep the workspace
@@ -24466,6 +24521,7 @@ export function heartbeatService(
             }
           }
         } catch (adapterErr) {
+          await clearLegacyToolApprovalsForRun(run.id);
           if (adapterErr instanceof NativeControllerDetachedForRestartError) {
             // Preserve the provider and its run for the new controller. This
             // also keeps generic teardown from terminalizing/releasing its lease.
@@ -26932,6 +26988,7 @@ export function heartbeatService(
               executionWorkspacePreference: issues.executionWorkspacePreference,
               executionWorkspaceSettings: issues.executionWorkspaceSettings,
               assigneeAgentId: issues.assigneeAgentId,
+              assigneeUserId: issues.assigneeUserId,
               executionRunId: issues.executionRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
               createdAt: issues.createdAt,
@@ -27140,6 +27197,37 @@ export function heartbeatService(
             }
             return { kind: "deferred" as const };
           };
+          // A settled automatic no-replay hold is a durable "verify before
+          // continuing" decision, but it must not lock an issue forever:
+          // without a release every later wake is parked as
+          // `deferred_issue_execution` with no run and the board has no action
+          // to resolve (CRE-15). Prove eligibility here and release the hold
+          // below, on the path that actually creates this wake's run.
+          let strandedNoReplayHoldReleasable = false;
+          const canReleaseStrandedNoReplayHold = async () => {
+            // Generic assignment recovery must never override a refused explicit
+            // continuation. Those requests retain their author, stop/cleanup and
+            // fresh-session contract even when the action is already settled.
+            if (opts.requestedByActorType === "user" || durableRequest || wakeCommentId ||
+                opts.queuedCommentInterruptId || opts.queuedCommentRequestId ||
+                reason === "retry_failed_run" || reason === "issue_commented" ||
+                reason === "issue_reopened_via_comment") return false;
+            // Only a system assignment may use this recovery fallback. Replaceable
+            // continuation/dependency polling must preserve the durable no-replay
+            // wait instead of manufacturing assignment authority from eligibility.
+            if (source !== "assignment" || reason !== "issue_assigned" ||
+                opts.requestedByActorType !== "system") return false;
+            // Only a plainly re-runnable issue may lose the hold: an open task
+            // with a single invokable agent owner and no human owner. An active
+            // or escalated action, a conversation owner, or an unsafe workspace
+            // archive keeps parking exactly as before.
+            if (!["todo", "blocked"].includes(issue.status)) return false;
+            if (issue.assigneeUserId || !issue.assigneeAgentId) return false;
+            const assignee = await getAgent(issue.assigneeAgentId);
+            if (!assignee || assignee.companyId !== issue.companyId ||
+                assignee.status === "paused" || assignee.status === "terminated") return false;
+            return isSettledNoReplayHoldOnly(tx as unknown as Db, issue.companyId, issue.id);
+          };
           const explicitContinuationRunId = randomUUID();
           const executionBlocker = await getExecutionBlocker(
             tx as unknown as Db, issue.companyId, issue.id,
@@ -27150,16 +27238,24 @@ export function heartbeatService(
           // A bound chat request has already rechecked its current principal
           // above. Treat its new user message like a board comment, but keep
           // failed-run retry actions on their separate exact-request path.
-          if (executionBlocker && !(await admitExplicitNativeContinuation({
-            db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
-            agentId, actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
-            reason: durableRequest && !failedChatRetry ? "issue_commented" : reason,
-            commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
-            queuedCommentInterruptId: opts.queuedCommentInterruptId,
-            queuedCommentRequestId: opts.queuedCommentRequestId,
-            dryRun: true,
-            onBlocked: (reason, message) => { continuationWait = { reason, message }; },
-          }))) return deferBlockedExecution(executionBlocker);
+          if (executionBlocker) {
+            // Prove the existing explicit-continuation contract first; only a
+            // wake that contract refuses may fall back to the one-time release
+            // of a settled no-replay hold.
+            if (!(await admitExplicitNativeContinuation({
+              db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
+              agentId, actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
+              reason: durableRequest && !failedChatRetry ? "issue_commented" : reason,
+              commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
+              queuedCommentInterruptId: opts.queuedCommentInterruptId,
+              queuedCommentRequestId: opts.queuedCommentRequestId,
+              dryRun: true,
+              onBlocked: (reason, message) => { continuationWait = { reason, message }; },
+            }))) {
+              strandedNoReplayHoldReleasable = await canReleaseStrandedNoReplayHold();
+              if (!strandedNoReplayHoldReleasable) return deferBlockedExecution(executionBlocker);
+            }
+          }
 
           const issueStateGuard = opts.issueStateGuard;
           if (
@@ -27924,7 +28020,18 @@ export function heartbeatService(
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
           });
-          if (!explicitContinuation && executionBlocker) return deferBlockedExecution(executionBlocker);
+          // Retire a settled no-replay hold on the path that actually creates
+          // this wake's run, in the same transaction, so a declined wake can
+          // never leave the issue unblocked without a run (CRE-15).
+          if (!explicitContinuation && executionBlocker) {
+            if (!strandedNoReplayHoldReleasable ||
+                !(await releaseSettledNoReplayHold(tx as unknown as Db, {
+                  companyId: issue.companyId, issueId: issue.id, agentId, reason,
+                  actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
+                }))) {
+              return deferBlockedExecution(executionBlocker);
+            }
+          }
           if (explicitContinuation) {
             enrichedContextSnapshot.forceFreshSession = true;
             enrichedContextSnapshot.previousRunId = explicitContinuation.previousRunId;
@@ -28777,6 +28884,13 @@ export function heartbeatService(
     reason = "Cancelled by control plane",
     options: CancelRunOptions = {},
   ) {
+    // Internal callers also revoke consent synchronously, even if lookup or
+    // termination fails. Only this immutable run identity is fenced.
+    // Audit failure cannot prevent provider cancellation. Report only a fixed
+    // code, never a storage error that could echo a credential/command.
+    void clearLegacyToolApprovalsForRun(runId).catch(() => {
+      logger.error({ runId, code: "legacy_consent_withdrawal_audit_failed_no_delivery" }, "legacy consent withdrawal audit failed; cancellation continues");
+    });
     let run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     const pendingNativeRetry =

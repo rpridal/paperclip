@@ -1284,6 +1284,8 @@ const RUNTIME_TOOLS_OPERATIONS = new Set([
 ]);
 
 const PUBLIC_OPERATIONS = new Set([
+  // Callable denial only: the handler exposes no prompt and unconditionally rejects.
+  "GET /api/heartbeat-runs/{runId}/legacy-tool-approvals/{requestId}",
   "GET /api/agent-avatars/{version}/{palette}/{file}",
   "GET /api/health",
   "GET /api/openapi.json",
@@ -1537,6 +1539,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
 ]);
 
 const INSTANCE_ADMIN_OPERATIONS = new Set([
+  "POST /api/heartbeat-runs/{runId}/legacy-tool-approvals/{requestId}/resolve",
   "POST /api/companies",
   "POST /api/plugins/install",
   "POST /api/instance/database-backups",
@@ -7046,6 +7049,68 @@ registry.registerPath({
     401: r.unauthorized,
     404: r.notFound,
     409: r.conflict,
+  },
+});
+
+// Existing legacy consent handlers deliberately have no success response.
+// These are contract registrations, not resolver authority or runtime grants.
+const legacyConsentUnavailableSchema = {
+  type: "object",
+  required: ["error", "code", "details"],
+  additionalProperties: false,
+  properties: {
+    error: { type: "string", enum: ["No supported designated legacy consent resolver authority is available."] },
+    code: { type: "string", enum: ["legacy_consent_resolver_contract_unavailable"] },
+    details: {
+      type: "object", required: ["code"], additionalProperties: false,
+      properties: { code: { type: "string", enum: ["legacy_consent_resolver_contract_unavailable"] } },
+    },
+  },
+};
+
+registry.registerPath({
+  method: "get",
+  path: "/api/heartbeat-runs/{runId}/legacy-tool-approvals/{requestId}",
+  tags: ["runs"],
+  summary: "Report unavailable designated legacy consent authority",
+  description: "The handler always returns 403, including for anonymous, board, instance-admin and agent actors. It does not validate either path identifier or look up a run/request. No prompt, provider identifier or command is exposed. Callable without credentials does not mean public approval data or resolver authority exists.",
+  request: { params: z.object({ runId: z.string(), requestId: z.string() }) },
+  responses: {
+    403: {
+      description: "Designated legacy consent resolver contract unavailable; no prompt read is supported.",
+      content: { "application/json": { schema: legacyConsentUnavailableSchema } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/heartbeat-runs/{runId}/legacy-tool-approvals/{requestId}/resolve",
+  tags: ["runs"],
+  summary: "Reject legacy approval consumption without designated authority",
+  description: "Requires a board actor, then instance-admin authority (local_implicit board is accepted by this preliminary gate). These checks do not designate a consent resolver. Next validates the untrimmed run UUID, trims requestId to 1–256 characters and accepts only the exact choice once or deny; additional body fields are ignored and cannot designate a resolver. Missing or inaccessible company-scoped runs return identical 404. Non-running runs or cancellation requested clear pending legacy approvals and return 409; stale/missing or mismatched company/agent pending requests also return 409. Otherwise returns 403 legacy_consent_resolver_contract_unavailable. It does not consume the pending request or invoke its provider resolver, even for instance admins. No successful response is implemented. Board mutation origin/transport guards still apply before the handler.",
+  request: {
+    params: z.object({
+      runId: heartbeatRunIdParamSchema,
+      requestId: z.string().trim().min(1).max(256).describe("Checked after trimming; whitespace around a non-empty identifier is accepted."),
+    }),
+    body: {
+      required: true,
+      content: { "application/json": { schema: {
+        type: "object", required: ["choice"], additionalProperties: true,
+        properties: { choice: { type: "string", enum: ["once", "deny"] } },
+      } } },
+    },
+  },
+  responses: {
+    400: { ...r.badRequest, description: "Malformed run UUID, empty/overlong trimmed requestId, unsupported choice, or invalid JSON body." },
+    403: {
+      description: "Board/admin prerequisite or mutation guard denied, or designated legacy consent resolver contract unavailable.",
+      content: { "application/json": { schema: { anyOf: [ErrorSchema, legacyConsentUnavailableSchema] } } },
+    },
+    404: { ...r.notFound, description: "Heartbeat run not found, including an inaccessible company; the same error is returned." },
+    409: { ...r.conflict, description: "Run is not running/cancellation is requested, or approval is stale, missing or bound to another company/agent." },
+    500: { ...r.serverError, description: "Internal failure, including pending-approval withdrawal audit failure; never a successful provider resolution." },
   },
 });
 

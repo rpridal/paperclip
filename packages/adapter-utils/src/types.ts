@@ -194,6 +194,30 @@ export interface AdapterRuntimeEvent {
   payload?: Record<string, unknown>;
 }
 
+/** Allowlisted, redacted provider text. Absence is not an inferred tool/risk. */
+export interface AdapterLegacyToolApprovalPrompt {
+  readonly tool?: string;
+  readonly action?: string;
+  readonly reason?: string;
+  readonly risk?: string;
+}
+
+/** A one-shot consent request from a legacy, non-native adapter transport. */
+export interface AdapterLegacyToolApproval {
+  provider: "hermes_gateway";
+  providerRunId: string;
+  requestId: string;
+  choices: readonly ["once", "deny"];
+  /** Immutable redacted text, not a permission or generic audit payload. */
+  readonly prompt?: AdapterLegacyToolApprovalPrompt;
+  /** Adapter-owned run deadline, not an invented provider expiry or grant. */
+  readonly expiresAt?: number;
+  /** Synchronous transport lifecycle fence, checked after durable preaudit. */
+  readonly isClosed?: () => boolean;
+  /** Sends the exact provider request; credentials remain adapter-private. */
+  resolve: (choice: "once" | "deny") => Promise<void>;
+}
+
 export interface AdapterExecutionContext {
   /** Run-scoped operator cancellation; adapters must settle before returning. */
   signal?: AbortSignal;
@@ -223,6 +247,8 @@ export interface AdapterExecutionContext {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
+  /** Host-owned resolver registration for a one-shot legacy tool consent. */
+  onLegacyToolApproval?: (approval: AdapterLegacyToolApproval) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
   /**
    * Reports that execution has crossed the adapter's dispatch boundary.

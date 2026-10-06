@@ -4454,6 +4454,39 @@ export function issueRoutes(
     }
   }
 
+  /**
+   * `executionBlocker` may point at a *settled* recovery action: a resolved
+   * no-replay hold still parks every wake, but it is no longer the "active"
+   * action this projection returned. The board then saw an issue with no
+   * action to resolve and no execution (CRE-15). Surface the referenced record
+   * read-only — no new authorization, same read gate as the active action.
+   */
+  async function referencedRecoveryActionForExecutionBlocker(input: {
+    issue: { id: string; companyId: string };
+    activeRecoveryAction: Awaited<ReturnType<typeof revalidateActiveSourceRecoveryForRead>>;
+  }) {
+    const blocker = await getExecutionBlocker(
+      db,
+      input.issue.companyId,
+      input.issue.id,
+    );
+    const referencedId = blocker?.recoveryActionId ?? null;
+    if (!referencedId || referencedId === input.activeRecoveryAction?.id)
+      return null;
+    const [row] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.id, referencedId),
+          eq(issueRecoveryActions.companyId, input.issue.companyId),
+          eq(issueRecoveryActions.sourceIssueId, input.issue.id),
+        ),
+      )
+      .limit(1);
+    return row ? issueRecoveryActionReadModel(row) : null;
+  }
+
   async function revalidateActiveSourceRecoveryAfterCommittedWrite(
     input: Parameters<typeof revalidateActiveSourceRecovery>[0],
   ) {
@@ -9103,9 +9136,16 @@ export function issueRoutes(
       trigger: "read_projection",
       actor: getActorInfo(req),
     });
+    // A blocker can reference a settled action that is no longer "active".
+    // Without it the board has nothing to resolve and the issue looks idle.
+    const referenced = await referencedRecoveryActionForExecutionBlocker({
+      issue,
+      activeRecoveryAction: active,
+    });
     res.json({
       active,
-      actions: active ? [active] : [],
+      actions: active ? [active] : referenced ? [referenced] : [],
+      referencedByExecutionBlocker: referenced?.id ?? null,
     });
   });
 

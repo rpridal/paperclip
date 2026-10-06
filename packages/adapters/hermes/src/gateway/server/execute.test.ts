@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
-import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import type { AdapterExecutionContext, AdapterLegacyToolApproval } from "@paperclipai/adapter-utils";
 import { execute, mapFinalResultForTest, parseSseFramesForTest, resolveSessionKey } from "./execute.js";
 import { testEnvironment } from "./test.js";
 
@@ -110,7 +110,7 @@ describe("execute", () => {
       }
       if (url.endsWith("/events")) {
         return new Response(
-          sseStream(["event: run.completed", "data: {\"status\":\"completed\",\"output\":\"done\"}", ""].join("\n")),
+          sseStream(["event: run.completed", "data: {\\\"run_id\\\":\\\"run-hermes-1\\\",\\\"status\\\":\\\"completed\\\",\\\"output\\\":\\\"done\\\"}", ""].join("\\n")),
           { status: 200, headers: { "content-type": "text/event-stream" } },
         );
       }
@@ -138,7 +138,7 @@ describe("execute", () => {
               "data: {\"delta\":\"done\"}",
               "",
               "event: run.completed",
-              "data: {\"status\":\"completed\",\"output\":\"done\",\"session_id\":\"session-1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2},\"model\":\"hermes-agent\"}",
+              "data: {\"run_id\":\"run-hermes-1\",\"status\":\"completed\",\"output\":\"done\",\"session_id\":\"session-1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2},\"model\":\"hermes-agent\"}",
               "",
             ].join("\n"),
           ),
@@ -383,7 +383,7 @@ describe("execute", () => {
               "data: {\"delta\":\"Authorization: Bearer secret-key\\nX-Hermes-Session-Key: paperclip:company:company-1:agent:agent-1:issue:issue-1\"}",
               "",
               "event: run.completed",
-              "data: {\"status\":\"completed\",\"output\":\"Authorization: Bearer secret-key\\nraw key secret-key\\nX-Hermes-Session-Key: paperclip:company:company-1:agent:agent-1:issue:issue-1\"}",
+              "data: {\"run_id\":\"run-hermes-1\",\"status\":\"completed\",\"output\":\"Authorization: Bearer secret-key raw key secret-key\\nX-Hermes-Session-Key: paperclip:company:company-1:agent:agent-1:issue:issue-1\"}",
               "",
             ].join("\n"),
           ),
@@ -686,6 +686,44 @@ describe("testEnvironment", () => {
         }),
       ]),
     );
+  });
+
+  it("forwards one exact deny through the legacy approval callback despite duplicate SSE events", async () => {
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 5 });
+    const approvals: Array<{ requestId: string; resolve: (choice: "once" | "deny") => Promise<void> }> = [];
+    ctx.onLegacyToolApproval = async (approval: AdapterLegacyToolApproval) => {
+      approvals.push(approval);
+      await approval.resolve("deny");
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) return new Response(JSON.stringify({ run_id: "hermes-run-1" }), { status: 200 });
+      if (url.endsWith("/events")) return new Response(sseStream([
+        "event: approval.request",
+        "data: {\"event\":\"approval.request\",\"run_id\":\"hermes-run-1\",\"request_id\":\"request-1\",\"choices\":[\"once\",\"deny\"]}",
+        "",
+        "event: approval.request",
+        "data: {\"event\":\"approval.request\",\"run_id\":\"hermes-run-1\",\"request_id\":\"request-1\",\"choices\":[\"once\",\"deny\"]}",
+        "",
+        "event: run.completed",
+        "data: {\"status\":\"completed\",\"output\":\"done\"}",
+        "",
+      ].join("\n")), { status: 200, headers: { "content-type": "text/event-stream" } });
+      if (url.endsWith("/approval")) {
+        expect(init?.headers).toMatchObject({ Authorization: "Bearer secret-key" });
+        expect(JSON.parse(String(init?.body))).toEqual({ request_id: "request-1", choice: "deny" });
+        return new Response(JSON.stringify({ run_id: "hermes-run-1", request_id: "request-1", choice: "deny", resolved: 1 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: "completed", output: "done" }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]?.requestId).toBe("request-1");
+    expect(fetchMock.mock.calls.filter(([input]: [RequestInfo | URL, RequestInit?]) => String(input).endsWith("/approval"))).toHaveLength(1);
   });
 
   it("tests a bare Hermes dashboard URL on port 9119 through the API prefix", async () => {
