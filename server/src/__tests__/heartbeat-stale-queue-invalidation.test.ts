@@ -30,6 +30,7 @@ import {
 import { runningProcesses } from "../adapters/index.ts";
 import { recoveryService } from "../services/recovery/service.ts";
 import { withQueuedCommentIdsInWakePayload } from "../services/issue-queued-comment-queue.ts";
+import * as liveEvents from "../services/live-events.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -812,6 +813,42 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       expect(countExecuteCallsForRun(runId)).toBe(0);
     },
   );
+
+  it("propagates an unrelated unique violation after committing a recovery receipt", async () => {
+    const { companyId, agentId: reviewerId } = await seedCompanyAndAgent();
+    const ownerId = randomUUID();
+    const issueId = randomUUID();
+    const interactionId = randomUUID();
+    await db.insert(agents).values({ id: ownerId, companyId, name: "RecoveryOwner", role: "engineer", status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Recovery post-commit failure", status: "in_review", priority: "medium", assigneeAgentId: ownerId });
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId, companyId, issueId, kind: "request_confirmation", status: "pending",
+      createdByAgentId: ownerId, addresseeAgentId: reviewerId, requestedResolverPolicy: "not_creator",
+      effectiveResolverPolicy: "not_creator", resolverPolicyProvenance: "explicit", effectiveResolverPolicySource: "requested",
+      payload: { version: 1, prompt: "Review current evidence" },
+    });
+    const failure = Object.assign(new Error("Unrelated post-commit unique violation"), { code: "23505", constraint: "unrelated_unique_constraint" });
+    const publish = vi.spyOn(liveEvents, "publishLiveEvent");
+    const originalPublish = publish.getMockImplementation()!;
+    publish.mockImplementation((event) => {
+      if (event.companyId === companyId && event.type === "heartbeat.run.queued") throw failure;
+      return originalPublish(event);
+    });
+    try {
+      await expect(heartbeat.wakeup(reviewerId, {
+        source: "on_demand", triggerDetail: "manual", reason: "interaction_pending",
+        manualUserWake: true, requestedByActorType: "user", requestedByActorId: "responsible-user",
+        idempotencyKey: "post-commit-error-attempt",
+        payload: { issueId, interactionId, interactionKind: "request_confirmation", mutation: "interaction" },
+        contextSnapshot: { issueId, taskId: issueId, interactionId, interactionKind: "request_confirmation", wakeReason: "interaction_pending", source: "issue.interaction.recovered" },
+      })).rejects.toBe(failure);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(1);
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+    } finally {
+      publish.mockRestore();
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.companyId, companyId));
+    }
+  });
 
   it("replays one pending recovery receipt across concurrent and ended-run retries", async () => {
     const { companyId, agentId: reviewerId } = await seedCompanyAndAgent();

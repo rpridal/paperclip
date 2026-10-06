@@ -20199,13 +20199,7 @@ export function heartbeatService(
     agentId: string,
     opts: WakeupOptions = {},
   ): ReturnType<typeof enqueueWakeup> {
-    const promise = enqueueWakeup(agentId, opts).catch(async (error) => {
-      const code = error?.code ?? error?.cause?.code;
-      if (code !== "23505") throw error;
-      const receipt = await readPendingRecoveryReceipt(db, agentId, opts);
-      if (!receipt) throw error;
-      return receipt.runId ? getRun(receipt.runId) : null;
-    });
+    const promise = enqueueWakeup(agentId, opts);
     activeWakeupPromises.add(promise);
     void promise
       .catch(() => {})
