@@ -261,6 +261,10 @@ import {
   PROVIDER_TRACE_MAX_BYTES,
 } from "./provider-trace-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
+import {
+  clearLegacyToolApprovalsForRun,
+  registerLegacyToolApproval,
+} from "./legacy-tool-approval-registry.js";
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
@@ -23008,6 +23012,37 @@ export function heartbeatService(
           });
         };
 
+        const onLegacyToolApproval = async (approval: import("@paperclipai/adapter-utils").AdapterLegacyToolApproval) => {
+          const activeRun = await getRun(currentRun.id);
+          if (!activeRun) return;
+          if (activeRun.status !== "running" ||
+              parseObject(parseObject(activeRun.resultJson).executionCancellation).state === "requested") {
+            clearLegacyToolApprovalsForRun(currentRun.id);
+            return;
+          }
+          // Persist only public, typed identifiers; the adapter retains its bearer credential
+          // inside the process-local resolver closure.
+          const registered = registerLegacyToolApproval({
+            runId: currentRun.id,
+            companyId: currentRun.companyId,
+            agentId: currentRun.agentId,
+            approval,
+          });
+          if (!registered) return;
+          await appendRunEvent(currentRun, {
+            eventType: "legacy.tool_approval.requested",
+            stream: "system",
+            level: "warn",
+            message: "A Hermes tool action is waiting for instance-admin approval.",
+            payload: {
+              provider: approval.provider,
+              providerRunId: approval.providerRunId,
+              requestId: approval.requestId,
+              choices: approval.choices,
+            },
+          });
+        };
+
         const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
           const eventType = event.eventType.trim();
           if (!eventType) return;
@@ -24366,6 +24401,7 @@ export function heartbeatService(
                     onLog,
                     onMeta: onAdapterMeta,
                     onEvent: onAdapterEvent,
+                    onLegacyToolApproval,
                     startupTraceContext: getStartupTraceContext(),
                     onRuntimeProgress: async (progress) => {
                       await recordCurrentHeartbeatRunRuntimeProgress(
@@ -24421,6 +24457,7 @@ export function heartbeatService(
               );
             if (!guardedDispatch.dispatched) return;
             adapterResult = await guardedDispatch.resultPromise;
+            clearLegacyToolApprovalsForRun(run.id);
           }
           adapterResult = applyWorkspaceRestoreFailure(adapterResult);
           // A returned result can include a failed restore. Keep the workspace
@@ -24466,6 +24503,7 @@ export function heartbeatService(
             }
           }
         } catch (adapterErr) {
+          clearLegacyToolApprovalsForRun(run.id);
           if (adapterErr instanceof NativeControllerDetachedForRestartError) {
             // Preserve the provider and its run for the new controller. This
             // also keeps generic teardown from terminalizing/releasing its lease.
@@ -28816,6 +28854,9 @@ export function heartbeatService(
     reason = "Cancelled by control plane",
     options: CancelRunOptions = {},
   ) {
+    // Internal callers also revoke consent synchronously, even if lookup or
+    // termination fails. Only this immutable run identity is fenced.
+    clearLegacyToolApprovalsForRun(runId);
     let run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     const pendingNativeRetry =
