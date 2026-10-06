@@ -147,6 +147,7 @@ export type QueuedRunFacts = {
   isConnectionContinuation?: boolean;
   isInteractionWake: boolean;
   isAddressedConfirmationParticipant?: boolean;
+  isBoundIssueReviewParticipant?: boolean;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
 
@@ -170,6 +171,7 @@ type OwnershipFacts = {
   isNonAssigneeWorkspaceBusyRetry: boolean;
   isInteractionWake?: boolean;
   isAddressedConfirmationParticipant?: boolean;
+  isBoundIssueReviewParticipant?: boolean;
   isCurrentReviewParticipant?: boolean;
   isAuthorizedSourceScopedRecovery?: boolean;
 };
@@ -186,6 +188,7 @@ function decideIssueOwnership(facts: OwnershipFacts): OwnershipOutcome {
   if (facts.isNonAssigneeWorkspaceBusyRetry) return "current_owner";
   if (facts.isInteractionWake) return "current_owner";
   if (facts.isAddressedConfirmationParticipant) return "current_owner";
+  if (facts.isBoundIssueReviewParticipant) return "current_owner";
   if (facts.isCurrentReviewParticipant) return "current_owner";
   if (facts.isAuthorizedSourceScopedRecovery) return "current_owner";
   return "reassigned";
@@ -568,6 +571,7 @@ export function decideQueuedRunStaleness(
     isNonAssigneeWorkspaceBusyRetry: facts.isNonAssigneeWorkspaceBusyRetry,
     isInteractionWake: facts.isInteractionWake,
     isAddressedConfirmationParticipant: facts.isAddressedConfirmationParticipant,
+    isBoundIssueReviewParticipant: facts.isBoundIssueReviewParticipant,
     isCurrentReviewParticipant:
       facts.reviewParticipant.isInReview &&
       facts.reviewParticipant.participantIsAgent &&
@@ -669,7 +673,7 @@ export function decideQueuedRunStaleness(
   const participantOutcome = decideReviewParticipant({
     ...facts.reviewParticipant,
     runAgentId: facts.runAgentId,
-    bypass: facts.wakeCommentIdPresent || facts.isAddressedConfirmationParticipant === true,
+    bypass: facts.wakeCommentIdPresent || facts.isAddressedConfirmationParticipant === true || facts.isBoundIssueReviewParticipant === true,
   });
   if (participantOutcome === "participant_changed") {
     return {

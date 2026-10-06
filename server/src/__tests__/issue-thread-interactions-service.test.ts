@@ -28,7 +28,7 @@ import {
 import { ONBOARDING_FIRST_TASK_ORIGIN_KIND } from "@paperclipai/shared";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
-import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import { isAddressedConfirmationRun, isBoundIssueReviewRun, issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { agentService } from "../services/agents.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -184,6 +184,65 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       const [afterIssue] = await db.select().from(issues).where(eq(issues.id, issue.id));
       expect(afterIssue).toEqual(beforeIssue);
       expect(await interactionsSvc.getForIssue(issue, interaction.id)).toEqual(beforeInteraction);
+    });
+
+    async function seedBoundReview(reviewPolicy: "anyone" | "not_creator" | "human_only" = "not_creator") {
+      const seeded = await seedParticipant();
+      await db.update(issues).set({ reviewPolicy, executionState: null }).where(eq(issues.id, seeded.issue.id));
+      await db.insert(activityLog).values({
+        companyId: seeded.issue.companyId, actorType: "agent", actorId: seeded.creatorId,
+        action: "issue.updated", entityType: "issue", entityId: seeded.issue.id,
+        details: { status: "in_review", _previous: { status: "in_progress" }, reviewInteractionId: seeded.interaction.id },
+      });
+      return seeded;
+    }
+
+    it.each(["anyone", "not_creator"] as const)("prepares bound review recovery under %s without acquiring developer ownership", async (reviewPolicy) => {
+      const { issue, actor, interaction } = await seedBoundReview(reviewPolicy);
+      const [before] = await db.select().from(issues).where(eq(issues.id, issue.id));
+      const prepared = await interactionsSvc.preparePendingConfirmationWake({ companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId, interactionId: interaction.id });
+      expect(prepared.contextSnapshot).toMatchObject({ issueId: issue.id, interactionId: interaction.id, reviewWork: "bound_issue_review" });
+      expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0]).toEqual(before);
+      expect((await interactionsSvc.getForIssue(issue, interaction.id)).status).toBe("pending");
+    });
+
+    it("denies bound review recovery when issue policy is human-only", async () => {
+      const { issue, actor, interaction } = await seedBoundReview("human_only");
+      await expect(interactionsSvc.preparePendingConfirmationWake({ companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId, interactionId: interaction.id })).rejects.toMatchObject({ status: 403 });
+    });
+
+    it("validates bound review recovery separately at queued and running boundaries", async () => {
+      const { issue, actor, interaction, creatorId } = await seedBoundReview();
+      const input = { companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId, runId: actor.runId };
+      await expect(isBoundIssueReviewRun(db, input)).resolves.toBe(false);
+      await expect(interactionsSvc.participate(issue, interaction.id, actor)).rejects.toMatchObject({ status: 403 });
+      const prepared = await interactionsSvc.preparePendingConfirmationWake({ companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId, interactionId: interaction.id });
+      await db.update(heartbeatRuns).set({ status: "queued", contextSnapshot: prepared.contextSnapshot }).where(eq(heartbeatRuns.id, actor.runId));
+      await expect(isBoundIssueReviewRun(db, input)).resolves.toBe(true);
+      await expect(isAddressedConfirmationRun(db, input)).resolves.toBe(false);
+      await expect(interactionsSvc.participate(issue, interaction.id, actor)).rejects.toMatchObject({ status: 422 });
+      await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, actor.runId));
+      await expect(interactionsSvc.participate(issue, interaction.id, actor)).resolves.toMatchObject({ scope: "issue_review", allowedActions: ["accept", "reject"] });
+      await expect(interactionsSvc.participate(issue, interaction.id, { agentId: actor.agentId })).rejects.toMatchObject({ status: 403 });
+      await db.update(issues).set({ reviewPolicy: "human_only" }).where(eq(issues.id, issue.id));
+      await expect(isBoundIssueReviewRun(db, input)).resolves.toBe(false);
+      await expect(interactionsSvc.participate(issue, interaction.id, actor)).rejects.toMatchObject({ status: 403 });
+      await db.update(issues).set({ reviewPolicy: "not_creator" }).where(eq(issues.id, issue.id));
+      await db.insert(activityLog).values({ companyId: issue.companyId, actorType: "agent", actorId: creatorId, action: "issue.updated", entityType: "issue", entityId: issue.id, details: { status: "in_review", _previous: { status: "in_progress" }, reviewInteractionId: randomUUID() } });
+      await expect(isBoundIssueReviewRun(db, input)).resolves.toBe(false);
+      expect((await issuesSvc.getById(issue.id))?.assigneeAgentId).toBe(creatorId);
+      expect((await interactionsSvc.getForIssue(issue, interaction.id)).status).toBe("pending");
+    });
+
+    it.each(["accept", "reject"] as const)("denies an ended canonical bound-review %s without resolving the original card", async (action) => {
+      const { issue, actor, interaction } = await seedBoundReview();
+      const prepared = await interactionsSvc.preparePendingConfirmationWake({ companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId, interactionId: interaction.id });
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(), contextSnapshot: prepared.contextSnapshot }).where(eq(heartbeatRuns.id, actor.runId));
+      const resolution = action === "accept"
+        ? interactionsSvc.acceptInteraction(issue, interaction.id, {}, actor)
+        : interactionsSvc.rejectInteraction(issue, interaction.id, { reason: "Exact candidate rejected" }, actor);
+      await expect(resolution).rejects.toMatchObject({ status: 422 });
+      expect((await interactionsSvc.getForIssue(issue, interaction.id)).status).toBe("pending");
     });
 
     it("denies pending recovery for another company, issue, agent or creator", async () => {

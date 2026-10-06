@@ -34,7 +34,7 @@ import {
   getIssueContinuationSummaryDocument,
 } from "../../../services/issue-continuation-summary.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
-import { isAddressedConfirmationRun } from "../../../services/issue-thread-interactions.js";
+import { isAddressedConfirmationRun, isBoundIssueReviewRun } from "../../../services/issue-thread-interactions.js";
 import { decideQueuedRunStaleness, decideScheduledRetryGate } from "../domain/policy.js";
 import type {
   QueuedRunFacts,
@@ -619,6 +619,9 @@ export function createPostgresRunDispatchAdapter(
       continuationSummaryBody,
       wakeReason,
       retryReason,
+      isBoundIssueReviewParticipant: issue && context.wakeReason === "interaction_pending" && context.reviewWork === "bound_issue_review"
+        ? await isBoundIssueReviewRun(dbOrTx, { companyId: input.companyId, issueId: issue.id, agentId: input.agentId, runId: input.runId })
+        : false,
       reviewParticipant: issue
         ? await readNativeReviewParticipantFacts(dbOrTx, {
             companyId: input.companyId, issueId, agentId: input.agentId,
@@ -1020,7 +1023,7 @@ export function createPostgresRunDispatchAdapter(
         input.now,
       );
       const decision =
-        !initialDecision.stale && issueId && !facts?.isAddressedConfirmationParticipant
+        !initialDecision.stale && issueId && !facts?.isAddressedConfirmationParticipant && !facts?.isBoundIssueReviewParticipant
           ? await tx
               .select({ executionRunId: issues.executionRunId })
               .from(issues)

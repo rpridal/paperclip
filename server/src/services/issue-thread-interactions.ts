@@ -499,6 +499,14 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
   if (isReviewVerdict && participationRequired) {
     throw forbidden("Bound issue reviews use the ordinary review decision path");
   }
+  if (actor.agentId && actor.runId) {
+    const recoveryRun = await tx.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, actor.runId), eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, actor.agentId)))
+      .then(rows => rows[0] ?? null);
+    if (recoveryRun?.contextSnapshot?.reviewWork === "bound_issue_review") {
+      await assertBoundReviewRecoveryAllowedUnderLock(tx, issue, interaction, actor, "running");
+    }
+  }
   const scopedParticipant =
     !isReviewVerdict && isScopedInteractionParticipant(issue, interaction, actor);
   if (!isReviewVerdict) {
@@ -655,9 +663,43 @@ async function assertScopedInteractionParticipationUnderLock(
   }
 }
 
-export async function isAddressedConfirmationRun(
+async function assertBoundReviewRecoveryAllowedUnderLock(
+  tx: Db,
+  issue: IssueResolutionContext,
+  interaction: IssueThreadInteractionRow,
+  actor: InteractionActor,
+  runStatus: "queued" | "running" | null = null,
+) {
+  if (!actor.agentId || interaction.status !== "pending" ||
+    !isScopedInteractionParticipant(issue, interaction, actor) ||
+    !issueThreadInteractionAttentionAgentAllowed({ agentId: actor.agentId, interaction }) ||
+    !await isActiveIssueReviewVerdict(tx, issue, interaction)) {
+    throw forbidden("Recovery requires the addressed independent bound-review resolver");
+  }
+  await assertIssueReviewVerdictActorAllowed(tx, { issue, actor: { type: "agent", id: actor.agentId } });
+  await assertRequestConfirmationTargetIsCurrent(tx, {
+    companyId: issue.companyId, issueId: issue.id,
+    target: (interaction.payload as RequestConfirmationInteraction["payload"]).target,
+    lockForUpdate: true,
+  });
+  if (runStatus) {
+    if (!actor.runId) throw forbidden("Bound-review participation requires its canonical recovery run");
+    const run = await tx.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, actor.runId), eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, actor.agentId)))
+      .then(rows => rows[0] ?? null);
+    if (run?.contextSnapshot?.reviewWork !== "bound_issue_review" ||
+      run.contextSnapshot.interactionId !== interaction.id ||
+      run.contextSnapshot.wakeReason !== "interaction_pending") {
+      throw forbidden("Bound-review participation requires its canonical recovery run");
+    }
+    await assertScopedInteractionParticipationUnderLock(tx, issue, interaction, actor, true, runStatus);
+  }
+}
+
+async function isConfirmationReviewRun(
   db: Db,
   input: { companyId: string; issueId: string; agentId: string; runId: string },
+  boundReview: boolean,
 ): Promise<boolean> {
   const run = await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
@@ -678,15 +720,28 @@ export async function isAddressedConfirmationRun(
   )).for("update").then((rows) => rows[0] ?? null);
   if (!issue || !interaction || interaction.status !== "pending") return false;
   try {
-    await assertRequestConfirmationResolutionAllowedUnderLock(
-      db, issue, interaction, { agentId: input.agentId, runId: input.runId },
-      true, run.status as "queued" | "running",
-    );
+    if (boundReview) {
+      await assertBoundReviewRecoveryAllowedUnderLock(db, issue, interaction,
+        { agentId: input.agentId, runId: input.runId }, run.status as "queued" | "running");
+    } else {
+      await assertRequestConfirmationResolutionAllowedUnderLock(
+        db, issue, interaction, { agentId: input.agentId, runId: input.runId },
+        true, run.status as "queued" | "running",
+      );
+    }
     return true;
   } catch (error) {
     if (error instanceof HttpError && error.status >= 400 && error.status < 500) return false;
     throw error;
   }
+}
+
+export function isAddressedConfirmationRun(db: Db, input: { companyId: string; issueId: string; agentId: string; runId: string }) {
+  return isConfirmationReviewRun(db, input, false);
+}
+
+export function isBoundIssueReviewRun(db: Db, input: { companyId: string; issueId: string; agentId: string; runId: string }) {
+  return isConfirmationReviewRun(db, input, true);
 }
 
 const REQUEST_CONFIRMATION_INTERACTION_KINDS = [
@@ -2731,10 +2786,11 @@ export function issueThreadInteractionService(
       }
       const actor = { agentId: selection.agentId };
       if (!issueThreadInteractionAttentionAgentAllowed({ agentId: selection.agentId, interaction }) ||
-        !isScopedInteractionParticipant(currentIssue, interaction, actor) ||
-        await isActiveIssueReviewVerdict(tx as unknown as Db, currentIssue, interaction)) {
+        !isScopedInteractionParticipant(currentIssue, interaction, actor)) {
         throw forbidden("Only an addressed confirmation participant can recover this interaction");
       }
+      const boundReview = await isActiveIssueReviewVerdict(tx as unknown as Db, currentIssue, interaction);
+      if (boundReview) await assertBoundReviewRecoveryAllowedUnderLock(tx as unknown as Db, currentIssue, interaction, actor);
       await assertRequestConfirmationTargetIsCurrent(tx, {
         companyId: selection.companyId,
         issueId: selection.issueId,
@@ -2744,7 +2800,9 @@ export function issueThreadInteractionService(
       const scope = { issueId: currentIssue.id, interactionId: interaction.id, interactionKind: interaction.kind };
       return {
         payload: { ...scope, mutation: "interaction" },
-        contextSnapshot: { ...scope, taskId: currentIssue.id, wakeReason: "interaction_pending", source: "issue.interaction.recovered" },
+        contextSnapshot: { ...scope, taskId: currentIssue.id, wakeReason: "interaction_pending", source: "issue.interaction.recovered",
+          ...(boundReview ? { reviewWork: "bound_issue_review" } : {}),
+        },
       };
     }),
     participate: async (
@@ -2772,17 +2830,16 @@ export function issueThreadInteractionService(
           .then((rows) => rows[0] ?? null);
         if (!current) throw interactionNotFoundError();
         if (current.status !== "pending") throw interactionTerminalError(current);
-        await assertRequestConfirmationResolutionAllowedUnderLock(
-          tx as unknown as Db,
-          currentIssue,
-          current,
-          actor,
-          true,
-        );
+        const boundReview = await isActiveIssueReviewVerdict(tx as unknown as Db, currentIssue, current);
+        if (boundReview) {
+          await assertBoundReviewRecoveryAllowedUnderLock(tx as unknown as Db, currentIssue, current, actor, "running");
+        } else {
+          await assertRequestConfirmationResolutionAllowedUnderLock(tx as unknown as Db, currentIssue, current, actor, true);
+        }
         return {
           interactionId: current.id,
           runId: actor.runId!,
-          scope: "interaction" as const,
+          scope: boundReview ? "issue_review" as const : "interaction" as const,
           allowedActions: ["accept", "reject"] as const,
           interaction: hydrateInteraction(current),
         };
