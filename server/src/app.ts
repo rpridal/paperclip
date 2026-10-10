@@ -24,6 +24,7 @@ import type { InspectDatabaseBackupHealthOptions } from "./services/database-bac
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
+import { intakeGuardMiddleware } from "./services/intake-guard.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import {
   privateHostnameGuard,
@@ -516,6 +517,8 @@ export async function createApp(
   // Default is unset → Express trusts nothing, which is the only safe choice
   // when the server may be reachable without a known reverse proxy in front.
   applyTrustProxy(app, parseTrustProxyEnv(process.env.TRUST_PROXY));
+  // Includes parser failures: pcif input is never eligible for body/header logs.
+  app.use(httpLogger);
 
   app.use(
     COMPANY_IMPORT_API_PATH,
@@ -539,7 +542,8 @@ export async function createApp(
     }),
   );
   app.use("/api", apiCompression());
-  app.use(httpLogger);
+  // Terminal lane precedes cloud assertions, runtime capabilities and cookies.
+  app.use(intakeGuardMiddleware(db));
   const privateHostnameGateEnabled = shouldEnablePrivateHostnameGuard({
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,

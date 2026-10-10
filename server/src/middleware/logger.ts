@@ -68,11 +68,19 @@ function privateWebhookLogUrl(url: unknown) {
     : "/api/chat-webhooks/:publicId/:provider";
 }
 
+function isIntakeRequest(req: { headers?: Record<string, unknown>; raw?: unknown }) {
+  const raw = req.raw as { headers?: Record<string, unknown> } | undefined;
+  const header = (raw?.headers ?? req.headers)?.authorization;
+  return typeof header === "string" && /^bearer\s+pcif_/i.test(header);
+}
+
 function requestLogUrl(req: {
+  headers?: Record<string, unknown>;
   method?: string;
   originalUrl?: unknown;
   url?: unknown;
 }) {
+  if (isIntakeRequest(req)) return "/intake-guard/:scoped-request";
   return isPrivateWebhook(req)
     ? privateWebhookLogUrl(requestClassificationUrl(req))
     : stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : "");
@@ -82,7 +90,10 @@ export function createHttpLogger(baseLogger: Logger) {
   return pinoHttp({
     logger: baseLogger,
     serializers: {
-      req(req: Record<string, unknown> & { url?: unknown }) {
+      req(req: Record<string, unknown> & { url?: unknown; headers?: Record<string, unknown>; raw?: unknown }) {
+        if (isIntakeRequest(req)) {
+          return { id: req.id, method: req.method, url: "/intake-guard/:scoped-request" };
+        }
         if (
           isPrivateWebhook({
             method: typeof req.method === "string" ? req.method : undefined,
@@ -113,13 +124,13 @@ export function createHttpLogger(baseLogger: Logger) {
       res(
         res: Record<string, unknown> & {
           raw?: {
-            req?: { method?: string; originalUrl?: unknown; url?: unknown };
+            req?: { headers?: Record<string, unknown>; method?: string; originalUrl?: unknown; url?: unknown };
           };
         },
       ) {
         // A provider error may also be reflected in response headers. Keep the
         // same content-free contract on both sides of a webhook request.
-        return res.raw?.req && isPrivateWebhook(res.raw.req)
+        return res.raw?.req && (isIntakeRequest(res.raw.req) || isPrivateWebhook(res.raw.req))
           ? { statusCode: res.statusCode }
           : res;
       },
@@ -136,6 +147,7 @@ export function createHttpLogger(baseLogger: Logger) {
       return `${req.method} ${requestLogUrl(req)} ${res.statusCode}`;
     },
     customErrorMessage(req, res, err) {
+      if (isIntakeRequest(req)) return `${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`;
       if (
         isSecretSensitiveHttpRequest(req.method, requestClassificationUrl(req))
       ) {
@@ -150,6 +162,7 @@ export function createHttpLogger(baseLogger: Logger) {
       return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — ${errMsg}`;
     },
     customErrorObject(req, _res, _err, value) {
+      if (isIntakeRequest(req)) return { ...value, err: { type: "Error", message: "Service request failed" } };
       // pino-http serializes res.err independently of customProps/errorContext.
       // Do not rely on a particular error handler having sanitized an SDK Error.
       return isPrivateWebhook(req)
@@ -160,6 +173,7 @@ export function createHttpLogger(baseLogger: Logger) {
         : value;
     },
     customProps(req, res) {
+      if (isIntakeRequest(req)) return {};
       if (res.statusCode >= 400) {
         const ctx = (res as any).__errorContext;
         if (isPrivateWebhook(req)) {
